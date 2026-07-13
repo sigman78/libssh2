@@ -68,6 +68,19 @@ libssh2_transform_makefile_inc("Makefile.inc" "${CMAKE_CURRENT_BINARY_DIR}/Makef
 include("${CMAKE_CURRENT_BINARY_DIR}/Makefile.inc.cmake")
 set(_sources ${CSOURCES} ${HHEADERS})
 
+# Vendored Monocypher (ed25519/x25519) is only needed by the mbedTLS backend.
+if(CRYPTO_BACKEND STREQUAL "mbedTLS")
+  list(APPEND _sources ${MONOCYPHER_CSOURCES})
+  # It is C99 and not ours to fix: exempt it from our picky warnings.
+  if(MSVC)
+    set_source_files_properties(${MONOCYPHER_CSOURCES}
+      PROPERTIES COMPILE_OPTIONS "-wd4242;-wd4244")  # u64 to u32
+  else()
+    set_source_files_properties(${MONOCYPHER_CSOURCES}
+      PROPERTIES COMPILE_OPTIONS "-w")
+  endif()
+endif()
+
 ## Library definition
 
 if(NOT DEFINED IMPORT_LIB_SUFFIX)

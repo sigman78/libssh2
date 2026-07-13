@@ -6,6 +6,9 @@ AUTOMAKE_OPTIONS = foreign nostdinc
 include Makefile.inc
 
 libssh2_la_SOURCES = $(CSOURCES) $(HHEADERS)
+if USE_MONOCYPHER
+libssh2_la_SOURCES += $(MONOCYPHER_CSOURCES)
+endif
 if HAVE_WINDRES
 libssh2_la_SOURCES += libssh2.rc
 endif

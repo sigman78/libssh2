@@ -172,6 +172,9 @@ else
   test "$found_crypto_str" = "" && found_crypto_str="$found_crypto"
 fi
 
+dnl Monocypher provides ed25519 and x25519 for the mbedTLS backend only
+AM_CONDITIONAL([USE_MONOCYPHER], [test "$found_crypto" = "mbedtls"])
+
 dnl ECDSA support with WinCNG
 AC_ARG_ENABLE(ecdsa-wincng,
   AS_HELP_STRING([--enable-ecdsa-wincng],

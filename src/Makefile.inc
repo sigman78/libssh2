@@ -20,6 +20,8 @@ CSOURCES =              \
   mac.c                 \
   mbedtls.c             \
   misc.c                \
+  monocypher-ed25519.c  \
+  monocypher.c          \
   openssl.c             \
   os400qc3.c            \
   packet.c              \
@@ -35,6 +37,11 @@ CSOURCES =              \
   version.c             \
   wincng.c
 
+# Vendored Monocypher: built for the mbedTLS backend only
+MONOCYPHER_CSOURCES =   \
+  monocypher-ed25519.c  \
+  monocypher.c
+
 HHEADERS =              \
   agent.h               \
   chacha.h              \
@@ -49,6 +56,8 @@ HHEADERS =              \
   mac.h                 \
   mbedtls.h             \
   misc.h                \
+  monocypher-ed25519.h  \
+  monocypher.h          \
   openssl.h             \
   os400qc3.h            \
   packet.h              \

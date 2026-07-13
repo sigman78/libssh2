@@ -21,6 +21,10 @@ my @options = (
     "-arealloc",
     "-asocket",
     "-berrno",
+    "-Wsrc/monocypher.c",
+    "-Wsrc/monocypher.h",
+    "-Wsrc/monocypher-ed25519.c",
+    "-Wsrc/monocypher-ed25519.h",
 );
 
 my @files;
