@@ -36,6 +36,11 @@
 
 #include <stdlib.h>
 
+#if LIBSSH2_ED25519
+#include "monocypher.h"
+#include "monocypher-ed25519.h"
+#endif
+
 /*******************************************************************/
 /*
  * mbedTLS backend: Global context handles
@@ -597,6 +602,25 @@ static unsigned char *mbed_gen_publickey_from_rsa(LIBSSH2_SESSION *session,
     return key;
 }
 
+#if LIBSSH2_ED25519
+/* Defined in the ED25519 section below. */
+static int mbed_ed25519_pub_priv_file(LIBSSH2_SESSION *session,
+                                      unsigned char **method,
+                                      size_t *method_len,
+                                      unsigned char **pubkeydata,
+                                      size_t *pubkeydata_len,
+                                      const char *privatekey,
+                                      const char *passphrase);
+static int mbed_ed25519_pub_priv_mem(LIBSSH2_SESSION *session,
+                                     unsigned char **method,
+                                     size_t *method_len,
+                                     unsigned char **pubkeydata,
+                                     size_t *pubkeydata_len,
+                                     const char *privatekeydata,
+                                     size_t privatekeydata_len,
+                                     const char *passphrase);
+#endif
+
 static int mbed_pub_priv_key(LIBSSH2_SESSION *session,
                              unsigned char **method,
                              size_t *method_len,
@@ -662,8 +686,15 @@ int ssh2_pub_priv_keyfile(LIBSSH2_SESSION *session,
     ret = mbedtls_pk_parse_keyfile(&pkey, privatekey, passphrase,
                                    mbedtls_ctr_drbg_random, &mbed_ctr_drbg);
     if(ret) {
-        mbedtls_strerror(ret, (char *)buf, sizeof(buf));
         mbedtls_pk_free(&pkey);
+#if LIBSSH2_ED25519
+        /* mbedTLS cannot parse OpenSSH-format keys; try ed25519 */
+        if(mbed_ed25519_pub_priv_file(session, method, method_len,
+                                      pubkeydata, pubkeydata_len,
+                                      privatekey, passphrase) == 0)
+            return 0;
+#endif
+        mbedtls_strerror(ret, (char *)buf, sizeof(buf));
         return ssh2_err_flags(session, LIBSSH2_ERROR_FILE, buf,
                               SSH2_ERR_FLAG_DUP);
     }
@@ -709,8 +740,16 @@ int ssh2_pub_priv_keyfilememory(LIBSSH2_SESSION *session,
     mbed_zero_free(data_nullterm, privatekeydata_len + 1);
 
     if(ret) {
-        mbedtls_strerror(ret, (char *)buf, sizeof(buf));
         mbedtls_pk_free(&pkey);
+#if LIBSSH2_ED25519
+        /* mbedTLS cannot parse OpenSSH-format keys; try ed25519 */
+        if(mbed_ed25519_pub_priv_mem(session, method, method_len,
+                                     pubkeydata, pubkeydata_len,
+                                     privatekeydata, privatekeydata_len,
+                                     passphrase) == 0)
+            return 0;
+#endif
+        mbedtls_strerror(ret, (char *)buf, sizeof(buf));
         return ssh2_err_flags(session, LIBSSH2_ERROR_FILE, buf,
                               SSH2_ERR_FLAG_DUP);
     }
@@ -1308,5 +1347,350 @@ void ssh2_ecdsa_free(ssh2_ecdsa_ctx *ec_ctx)
     mbedtls_free(ec_ctx);
 }
 #endif /* LIBSSH2_ECDSA */
+
+#if LIBSSH2_ED25519
+
+/*******************************************************************/
+/*
+ * mbedTLS backend: ED25519 / curve25519 functions
+ * (via bundled Monocypher)
+ */
+
+void mbed_ed25519_free(ssh2_ed25519_ctx *ctx)
+{
+    if(ctx)
+        mbed_zero_free(ctx, sizeof(*ctx));
+}
+
+/*
+ * Creates a public key context given a raw 32-byte ed25519 public key
+ */
+int ssh2_ed25519_new_public(ssh2_ed25519_ctx **ed_ctx,
+                            LIBSSH2_SESSION *session,
+                            const unsigned char *raw_pub_key,
+                            const size_t key_len)
+{
+    ssh2_ed25519_ctx *ctx;
+
+    if(key_len != SSH2_ED25519_KEY_LEN)
+        return ssh2_err(session, LIBSSH2_ERROR_PROTO,
+                        "Invalid ed25519 public key length");
+
+    ctx = mbedtls_calloc(1, sizeof(*ctx));
+    if(!ctx)
+        return ssh2_err(session, LIBSSH2_ERROR_ALLOC,
+                        "Unable to allocate memory for ed25519 key");
+
+    memcpy(ctx->public_key, raw_pub_key, SSH2_ED25519_KEY_LEN);
+
+    *ed_ctx = ctx;
+
+    return 0;
+}
+
+/*
+ * Creates a key context from the remainder of a decrypted
+ * openssh-key-v1 blob, after the key type name has been consumed
+ */
+static int mbed_ed25519_parse_openssh_blob(ssh2_ed25519_ctx **ed_ctx,
+                                           LIBSSH2_SESSION *session,
+                                           struct string_buf *decrypted)
+{
+    ssh2_ed25519_ctx *ctx;
+    unsigned char *pub_key, *priv_key;
+    size_t tmp_len;
+    uint8_t seed[SSH2_ED25519_KEY_LEN];
+
+    if(ssh2_get_string(decrypted, &pub_key, &tmp_len) ||
+       tmp_len != SSH2_ED25519_KEY_LEN)
+        return ssh2_err(session, LIBSSH2_ERROR_PROTO,
+                        "Wrong ed25519 public key length");
+
+    /* private key blob is seed (32 bytes) || public key (32 bytes) */
+    if(ssh2_get_string(decrypted, &priv_key, &tmp_len) ||
+       tmp_len != SSH2_ED25519_PRIVATE_KEY_LEN)
+        return ssh2_err(session, LIBSSH2_ERROR_PROTO,
+                        "Wrong ed25519 private key length");
+
+    ctx = mbedtls_calloc(1, sizeof(*ctx));
+    if(!ctx)
+        return ssh2_err(session, LIBSSH2_ERROR_ALLOC,
+                        "Unable to allocate memory for ed25519 key");
+
+    /* Recompute the public key from the seed rather than trusting the
+       file; crypto_ed25519_key_pair() wipes the seed buffer. */
+    memcpy(seed, priv_key, SSH2_ED25519_KEY_LEN);
+    crypto_ed25519_key_pair(ctx->private_key, ctx->public_key, seed);
+
+    if(memcmp(ctx->public_key, pub_key, SSH2_ED25519_KEY_LEN) != 0) {
+        mbed_ed25519_free(ctx);
+        return ssh2_err(session, LIBSSH2_ERROR_PROTO,
+                        "Ed25519 public/private key mismatch");
+    }
+
+    ctx->has_private = 1;
+    *ed_ctx = ctx;
+
+    return 0;
+}
+
+static int mbed_ed25519_parse_decrypted(ssh2_ed25519_ctx **ed_ctx,
+                                        LIBSSH2_SESSION *session,
+                                        struct string_buf *decrypted)
+{
+    unsigned char *name;
+    size_t name_len;
+
+    if(ssh2_get_string(decrypted, &name, &name_len) ||
+       name_len != 11 || memcmp(name, "ssh-ed25519", 11) != 0)
+        return ssh2_err(session, LIBSSH2_ERROR_PROTO,
+                        "Not an ssh-ed25519 private key");
+
+    return mbed_ed25519_parse_openssh_blob(ed_ctx, session, decrypted);
+}
+
+/*
+ * Creates a new private key given a file path and password
+ */
+int ssh2_ed25519_new_private(ssh2_ed25519_ctx **ed_ctx,
+                             LIBSSH2_SESSION *session,
+                             const char *filename,
+                             const uint8_t *passphrase)
+{
+    FILE *fp;
+    int rc;
+    struct string_buf *decrypted = NULL;
+
+    fp = fopen(filename, "rb");
+    if(!fp)
+        return ssh2_err(session, LIBSSH2_ERROR_FILE,
+                        "Unable to open ed25519 private key file");
+
+    rc = ssh2_openssh_pem_parse(session, passphrase, fp, &decrypted);
+    fclose(fp);
+    if(rc)
+        return rc;
+
+    rc = mbed_ed25519_parse_decrypted(ed_ctx, session, decrypted);
+
+    ssh2_string_buf_free(session, decrypted);
+
+    return rc;
+}
+
+/*
+ * Creates a new private key given key file data and password
+ */
+int ssh2_ed25519_new_private_frommemory(ssh2_ed25519_ctx **ed_ctx,
+                                        LIBSSH2_SESSION *session,
+                                        const char *blob, size_t blob_len,
+                                        const unsigned char *passphrase)
+{
+    int rc;
+    struct string_buf *decrypted = NULL;
+
+    rc = ssh2_openssh_pem_parse_memory(session, passphrase,
+                                       blob, blob_len, &decrypted);
+    if(rc)
+        return rc;
+
+    rc = mbed_ed25519_parse_decrypted(ed_ctx, session, decrypted);
+
+    ssh2_string_buf_free(session, decrypted);
+
+    return rc;
+}
+
+/*
+ * Builds the userauth method name and public key blob from a loaded
+ * ed25519 key, for ssh2_pub_priv_keyfile{,memory}()
+ */
+static int mbed_ed25519_pub_priv(LIBSSH2_SESSION *session,
+                                 unsigned char **method,
+                                 size_t *method_len,
+                                 unsigned char **pubkeydata,
+                                 size_t *pubkeydata_len,
+                                 ssh2_ed25519_ctx *ctx)
+{
+    unsigned char *mth, *key = NULL, *p;
+
+    mth = SSH2_ALLOC(session, 11);
+    if(mth)
+        key = SSH2_ALLOC(session, 4 + 11 + 4 + SSH2_ED25519_KEY_LEN);
+
+    if(!mth || !key) {
+        if(mth)
+            SSH2_FREE(session, mth);
+        return ssh2_err(session, LIBSSH2_ERROR_ALLOC,
+                        "Unable to allocate memory for ed25519 public key");
+    }
+
+    memcpy(mth, "ssh-ed25519", 11);
+
+    p = key;
+    ssh2_store_str(&p, "ssh-ed25519", 11);
+    ssh2_store_str(&p, (const char *)ctx->public_key, SSH2_ED25519_KEY_LEN);
+
+    *method = mth;
+    *method_len = 11;
+    *pubkeydata = key;
+    *pubkeydata_len = 4 + 11 + 4 + SSH2_ED25519_KEY_LEN;
+
+    return 0;
+}
+
+static int mbed_ed25519_pub_priv_file(LIBSSH2_SESSION *session,
+                                      unsigned char **method,
+                                      size_t *method_len,
+                                      unsigned char **pubkeydata,
+                                      size_t *pubkeydata_len,
+                                      const char *privatekey,
+                                      const char *passphrase)
+{
+    ssh2_ed25519_ctx *ctx = NULL;
+    int rc;
+
+    rc = ssh2_ed25519_new_private(&ctx, session, privatekey,
+                                  (const uint8_t *)passphrase);
+    if(rc)
+        return rc;
+
+    rc = mbed_ed25519_pub_priv(session, method, method_len,
+                               pubkeydata, pubkeydata_len, ctx);
+
+    mbed_ed25519_free(ctx);
+
+    return rc;
+}
+
+static int mbed_ed25519_pub_priv_mem(LIBSSH2_SESSION *session,
+                                     unsigned char **method,
+                                     size_t *method_len,
+                                     unsigned char **pubkeydata,
+                                     size_t *pubkeydata_len,
+                                     const char *privatekeydata,
+                                     size_t privatekeydata_len,
+                                     const char *passphrase)
+{
+    ssh2_ed25519_ctx *ctx = NULL;
+    int rc;
+
+    rc = ssh2_ed25519_new_private_frommemory(
+        &ctx, session, privatekeydata, privatekeydata_len,
+        (const unsigned char *)passphrase);
+    if(rc)
+        return rc;
+
+    rc = mbed_ed25519_pub_priv(session, method, method_len,
+                               pubkeydata, pubkeydata_len, ctx);
+
+    mbed_ed25519_free(ctx);
+
+    return rc;
+}
+
+/*
+ * Computes the ed25519 signature of a message
+ */
+int ssh2_ed25519_sign(ssh2_ed25519_ctx *ed_ctx, LIBSSH2_SESSION *session,
+                      uint8_t **out_sig, size_t *out_sig_len,
+                      const uint8_t *message, size_t message_len)
+{
+    uint8_t *sig;
+
+    if(!ed_ctx || !ed_ctx->has_private)
+        return ssh2_err(session, LIBSSH2_ERROR_INVAL,
+                        "No ed25519 private key available for signing");
+
+    sig = SSH2_ALLOC(session, SSH2_ED25519_SIG_LEN);
+    if(!sig)
+        return ssh2_err(session, LIBSSH2_ERROR_ALLOC,
+                        "Unable to allocate memory for ed25519 signature");
+
+    crypto_ed25519_sign(sig, ed_ctx->private_key, message, message_len);
+
+    *out_sig = sig;
+    *out_sig_len = SSH2_ED25519_SIG_LEN;
+
+    return 0;
+}
+
+/*
+ * Verifies an ed25519 signature of a message
+ */
+int ssh2_ed25519_verify(ssh2_ed25519_ctx *ed_ctx, LIBSSH2_SESSION *session,
+                        const uint8_t *s, size_t s_len,
+                        const uint8_t *m, size_t m_len)
+{
+    (void)session;
+
+    if(!ed_ctx || s_len != SSH2_ED25519_SIG_LEN)
+        return -1;
+
+    return crypto_ed25519_check(s, ed_ctx->public_key, m, m_len) ? -1 : 0;
+}
+
+/*
+ * Generates an ephemeral x25519 key pair for curve25519 key exchange
+ */
+int ssh2_curve25519_new(LIBSSH2_SESSION *session,
+                        uint8_t **out_public_key,
+                        uint8_t **out_private_key)
+{
+    uint8_t *priv, *pub = NULL;
+
+    priv = SSH2_ALLOC(session, SSH2_ED25519_KEY_LEN);
+    if(priv)
+        pub = SSH2_ALLOC(session, SSH2_ED25519_KEY_LEN);
+
+    if(!priv || !pub || ssh2_random(priv, SSH2_ED25519_KEY_LEN)) {
+        if(priv) {
+            ssh2_explicit_zero(priv, SSH2_ED25519_KEY_LEN);
+            SSH2_FREE(session, priv);
+        }
+        if(pub)
+            SSH2_FREE(session, pub);
+        return ssh2_err(session, LIBSSH2_ERROR_KEX_FAILURE,
+                        "Unable to create curve25519 key pair");
+    }
+
+    crypto_x25519_public_key(pub, priv);
+
+    *out_private_key = priv;
+    *out_public_key = pub;
+
+    return 0;
+}
+
+/*
+ * Computes the shared secret K from the local private key and the
+ * server's public key; *k must already be initialized
+ */
+int ssh2_curve25519_gen_k(ssh2_bn **k,
+                          uint8_t private_key[SSH2_ED25519_KEY_LEN],
+                          uint8_t server_public_key[SSH2_ED25519_KEY_LEN])
+{
+    uint8_t shared_key[SSH2_ED25519_KEY_LEN];
+    static const uint8_t zero[SSH2_ED25519_KEY_LEN];
+    int rc;
+
+    if(!k || !*k)
+        return -1;
+
+    crypto_x25519(shared_key, private_key, server_public_key);
+
+    /* RFC 8731: reject the all-zero shared secret produced by
+       low-order server public keys */
+    if(!crypto_verify32(shared_key, zero))
+        return -1;
+
+    rc = ssh2_bn_from_bin(*k, shared_key, SSH2_ED25519_KEY_LEN) ? -1 : 0;
+
+    ssh2_explicit_zero(shared_key, sizeof(shared_key));
+
+    return rc;
+}
+
+#endif /* LIBSSH2_ED25519 */
 
 #endif /* LIBSSH2_MBEDTLS */

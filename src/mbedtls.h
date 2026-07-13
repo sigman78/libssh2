@@ -98,7 +98,9 @@
 #else
 # define LIBSSH2_ECDSA 0
 #endif
-#define LIBSSH2_ED25519 0
+/* ED25519 and X25519 (curve25519 kex) are provided by the bundled
+   Monocypher, independent of mbedTLS capabilities. */
+#define LIBSSH2_ED25519 1
 #define LIBSSH2_MLKEM 0
 
 #include "crypto_config.h"
@@ -213,6 +215,23 @@ typedef enum {
     mbedtls_mpi_write_binary(bn, bin, mbedtls_mpi_size(bn))
 #define ssh2_bn_bytes(bn)              mbedtls_mpi_size(bn)
 #define ssh2_bn_bits(bn)               mbedtls_mpi_bitlen(bn)
+
+/*******************************************************************/
+/*
+ * mbedTLS backend: ED25519 support (via bundled Monocypher).
+ */
+
+#if LIBSSH2_ED25519
+struct mbed_ed25519_ctx {
+    uint8_t public_key[32];
+    uint8_t private_key[64];  /* seed (32 bytes) || public key (32 bytes) */
+    int has_private;
+};
+#define ssh2_ed25519_ctx struct mbed_ed25519_ctx
+
+void mbed_ed25519_free(ssh2_ed25519_ctx *ctx);
+#define ssh2_ed25519_free(ctx) mbed_ed25519_free(ctx)
+#endif
 
 /*******************************************************************/
 /*
