@@ -73,6 +73,12 @@ libssh2_transform_makefile_inc("Makefile.inc" "${CMAKE_CURRENT_BINARY_DIR}/Makef
 include("${CMAKE_CURRENT_BINARY_DIR}/Makefile.inc.cmake")
 set(_sources ${CSOURCES} ${HHEADERS})
 
+# Vendored Monocypher is C99; exempt it from our picky warnings.
+if(NOT MSVC)
+  set_source_files_properties(monocypher.c monocypher-ed25519.c
+    PROPERTIES COMPILE_OPTIONS "-w")
+endif()
+
 ## Library definition
 
 if(NOT DEFINED IMPORT_LIB_SUFFIX)
