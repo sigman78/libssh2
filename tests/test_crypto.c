@@ -1023,6 +1023,99 @@ static int test_aes_cbc_kat(void)
 }
 #endif
 
+/* PSA has 32 volatile key slots: many init/crypt/dtor rounds only work
+   if every round gives its slot back. FIRST_BLOCK leaves a GCM operation
+   active, so this also checks that dtor aborts it. */
+static int cipher_slot_loop(const char *name, SSH2_CIPHER_T(algo),
+                            size_t keylen, size_t ivlen, size_t bs)
+{
+    unsigned char key[32], iv[16], buf[16];
+    ssh2_cipher_ctx c;
+    int i;
+
+    memset(key, 0x42, sizeof(key));
+    memset(iv, 0x24, sizeof(iv));
+    (void)keylen;
+    (void)ivlen;
+    for(i = 0; i < 48; i++) {
+        memset(buf, 0, sizeof(buf));
+        if(ssh2_cipher_init(&c, algo, iv, key, i & 1)) {
+            fprintf(stderr, "%s: init failed in round %d\n", name, i);
+            return 1;
+        }
+        if(ssh2_cipher_crypt(&c, algo, i & 1, buf, bs, FIRST_BLOCK)) {
+            fprintf(stderr, "%s: crypt failed in round %d\n", name, i);
+            ssh2_cipher_dtor(&c);
+            return 1;
+        }
+        ssh2_cipher_dtor(&c);
+    }
+    return 0;
+}
+
+#ifdef LIBSSH2_MBEDTLS
+/* Bare, double and failed-init teardown must all be harmless */
+static int check_cipher_edges(void)
+{
+    ssh2_cipher_ctx c;
+    unsigned char key[32] = { 0 }, iv[16] = { 0 }, buf[17] = { 0 };
+    int rc = 1;
+
+    memset(&c, 0, sizeof(c));
+    ssh2_cipher_dtor(&c);
+    ssh2_cipher_dtor(&c);
+
+    /* the enum value exists for the API but the backend has no
+       ChaCha20-Poly1305 yet */
+    EXPECT(ssh2_cipher_init(&c, ssh2_cipher_chacha20, iv, key, 1) != 0);
+    ssh2_cipher_dtor(&c);
+    EXPECT(check_no_key_slots() == 0);
+
+#if LIBSSH2_AES_CBC
+    /* transport only passes whole blocks; PSA would hold a partial
+       one back, so the length check in crypt() rejects it */
+    EXPECT(ssh2_cipher_init(&c, ssh2_cipher_aes128, iv, key, 1) == 0);
+    EXPECT(ssh2_cipher_crypt(&c, ssh2_cipher_aes128, 1, buf, 15,
+                             MIDDLE_BLOCK) == -1);
+    ssh2_cipher_dtor(&c);
+    EXPECT(ssh2_cipher_init(&c, ssh2_cipher_aes128, iv, key, 1) == 0);
+    EXPECT(ssh2_cipher_crypt(&c, ssh2_cipher_aes128, 1, buf, 17,
+                             MIDDLE_BLOCK) == -1);
+    ssh2_cipher_dtor(&c);
+#else
+    (void)buf;
+#endif
+    rc = 0;
+fail:
+    return rc;
+}
+#endif
+
+static int test_cipher_slots(void)
+{
+    int rc = 0;
+#if LIBSSH2_AES_CTR
+    rc |= cipher_slot_loop("aes128-ctr", ssh2_cipher_aes128ctr, 16, 16, 16);
+    rc |= cipher_slot_loop("aes256-ctr", ssh2_cipher_aes256ctr, 32, 16, 16);
+#endif
+#if LIBSSH2_AES_CBC
+    rc |= cipher_slot_loop("aes128-cbc", ssh2_cipher_aes128, 16, 16, 16);
+    rc |= cipher_slot_loop("aes256-cbc", ssh2_cipher_aes256, 32, 16, 16);
+#endif
+#if LIBSSH2_3DES
+    rc |= cipher_slot_loop("3des-cbc", ssh2_cipher_3des, 24, 8, 8);
+#endif
+#if LIBSSH2_AES_GCM
+    rc |= cipher_slot_loop("aes128-gcm", ssh2_cipher_aes128gcm, 16, 12, 16);
+    rc |= cipher_slot_loop("aes256-gcm", ssh2_cipher_aes256gcm, 32, 12, 16);
+#endif
+#ifdef LIBSSH2_MBEDTLS
+    rc |= check_cipher_edges();
+#endif
+    rc |= check_no_key_slots();
+    return rc;
+}
+
 #if LIBSSH2_AES_CTR || LIBSSH2_AES_CBC || LIBSSH2_3DES
 /* Random key and IV, four chunks of different multiples of the block
    size, in place; a second context decrypts chunk by chunk. */
@@ -1117,6 +1210,9 @@ static int test_cipher_roundtrips(void)
     rc |= cipher_roundtrip("aes256-cbc", ssh2_cipher_aes256, 32, 16, 16);
 #endif
 #if LIBSSH2_3DES
+    /* LIBSSH2_3DES is forced to 0 unless LIBSSH2_3DES_ENABLE is defined
+       (for example -DLIBSSH2_3DES_ENABLE=ON with CMake), so this case
+       only runs in builds that opt in. */
     rc |= cipher_roundtrip("3des-cbc", ssh2_cipher_3des, 24, 8, 8);
 #endif
     return rc;
@@ -1131,10 +1227,16 @@ static int test_cipher_roundtrips(void)
          one only 4 bytes; FIRST_BLOCK for i == 0, else MIDDLE_BLOCK;
          then one crypt() of the 16 tag bytes at offset L, LAST_BLOCK.
          Bytes 0-3 are AAD (left in the clear), the tag is written.
-   recv: crypt() of the first 16 bytes with FIRST_BLOCK; then 16-byte
-         MIDDLE_BLOCK slices until fewer than 32 bytes remain; the rest
-         (payload tail plus the tag, 16..31 bytes) in one LAST_BLOCK call.
-         Tag mismatch makes that LAST_BLOCK call fail.
+   recv: the first 16 bytes with FIRST_BLOCK, then either of two shapes
+         (transport_decrypt() in src/transport.c). Whole packet buffered
+         (numdecrypt covers payload and tag, LAST_BLOCK): 16-byte
+         MIDDLE_BLOCK slices while 32 or more bytes remain, then the rest
+         (4 payload + tag = 20 bytes) as one LAST_BLOCK call. Tag not yet
+         buffered (the MIDDLE_BLOCK numdecrypt is capped to leave one block
+         for the tag): m 16-byte MIDDLE_BLOCK slices and a 4-byte
+         MIDDLE_BLOCK one, and later a LAST_BLOCK call holding only the
+         16 tag bytes. The last call is thus 20 or 16 bytes.
+         Tag mismatch makes the LAST_BLOCK call fail.
    The IV is incremented after each packet, so a context pair is run
    through two packets. */
 #define GCM_BS  16
@@ -1154,8 +1256,10 @@ static int gcm_send(ssh2_cipher_ctx *c, SSH2_CIPHER_T(algo),
     return ssh2_cipher_crypt(c, algo, 1, pkt + L, GCM_TAG, LAST_BLOCK);
 }
 
+/* tag_late selects the capped shape: the payload is fed first, the tag
+   arrives in a LAST_BLOCK call of its own */
 static int gcm_recv(ssh2_cipher_ctx *c, SSH2_CIPHER_T(algo),
-                    unsigned char *pkt, size_t L)
+                    unsigned char *pkt, size_t L, int tag_late)
 {
     size_t len = L + GCM_TAG, off = 0;
     int first = 1;
@@ -1166,6 +1270,15 @@ static int gcm_recv(ssh2_cipher_ctx *c, SSH2_CIPHER_T(algo),
 
         if(first)
             fl = FIRST_BLOCK;
+        else if(tag_late) {
+            if(len == GCM_TAG)
+                fl = LAST_BLOCK;
+            else {
+                fl = MIDDLE_BLOCK;
+                if(len - GCM_TAG < n)
+                    n = len - GCM_TAG;
+            }
+        }
         else if(len < 2 * GCM_BS) {
             n = len;
             fl = LAST_BLOCK;
@@ -1182,6 +1295,32 @@ static int gcm_recv(ssh2_cipher_ctx *c, SSH2_CIPHER_T(algo),
     return 0;
 }
 
+#ifdef LIBSSH2_MBEDTLS
+/* Expected ciphertext and tag from one-shot PSA, independent of the
+   streaming code: catches IV byte order, carry and AAD placement errors
+   that an encrypt-then-decrypt round trip would repeat on both sides. */
+static int gcm_reference(const unsigned char *key, size_t keylen,
+                         const unsigned char *iv, const unsigned char *plain,
+                         size_t L, unsigned char *out)
+{
+    psa_key_attributes_t at = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_id_t id = PSA_KEY_ID_NULL;
+    size_t olen = 0;
+    psa_status_t st;
+
+    psa_set_key_type(&at, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&at, keylen * 8);
+    psa_set_key_algorithm(&at, PSA_ALG_GCM);
+    psa_set_key_usage_flags(&at, PSA_KEY_USAGE_ENCRYPT);
+    if(psa_import_key(&at, key, keylen, &id) != PSA_SUCCESS)
+        return -1;
+    st = psa_aead_encrypt(id, PSA_ALG_GCM, iv, 12, plain, 4,
+                          plain + 4, L - 4, out, L - 4 + GCM_TAG, &olen);
+    (void)psa_destroy_key(id);
+    return (st == PSA_SUCCESS && olen == L - 4 + GCM_TAG) ? 0 : -1;
+}
+#endif
+
 static int gcm_case(const char *name, SSH2_CIPHER_T(algo), size_t keylen)
 {
     static const size_t blocks[2] = { 2, 5 };
@@ -1195,6 +1334,8 @@ static int gcm_case(const char *name, SSH2_CIPHER_T(algo), size_t keylen)
 
     EXPECT(ssh2_random(key, keylen) == 0);
     EXPECT(ssh2_random(iv, sizeof(iv)) == 0);
+    /* the first increment must carry into byte 10 */
+    iv[11] = 0xFF;
 
     for(i = 0; i < 2; i++) {
         L[i] = 4 + 16 * blocks[i];
@@ -1217,14 +1358,73 @@ static int gcm_case(const char *name, SSH2_CIPHER_T(algo), size_t keylen)
         EXPECT(memcmp(wire[i] + 4, plain[i] + 4, L[i] - 4) != 0);
     }
 
+#ifdef LIBSSH2_MBEDTLS
+    {
+        unsigned char nonce[12], ref[16 * 5 + GCM_TAG];
+        int k;
+
+        memcpy(nonce, iv, sizeof(nonce));
+        for(i = 0; i < 2; i++) {
+            if(i) {
+                for(k = 11; k >= 4; k--)
+                    if(++nonce[k])
+                        break;
+            }
+            EXPECT(gcm_reference(key, keylen, nonce, plain[i], L[i],
+                                 ref) == 0);
+            EXPECT(memcmp(wire[i] + 4, ref, L[i] - 4) == 0);
+            EXPECT(memcmp(wire[i] + L[i], ref + L[i] - 4, GCM_TAG) == 0);
+        }
+    }
+#endif
+
     /* the second packet is only right if the IV was bumped in between */
     for(i = 0; i < 2; i++) {
         memcpy(bad, wire[i], L[i] + GCM_TAG);
-        if(gcm_recv(&dec, algo, bad, L[i]))
+        if(gcm_recv(&dec, algo, bad, L[i], 0))
             FAIL(name);
         EXPECT(memcmp(bad, plain[i], L[i]) == 0);
     }
 
+    ssh2_cipher_dtor(&dec);
+    have_dec = 0;
+
+    /* same packets with the tag arriving in a call of its own */
+    if(ssh2_cipher_init(&dec, algo, iv, key, 0))
+        FAIL(name);
+    have_dec = 1;
+    for(i = 0; i < 2; i++) {
+        memcpy(bad, wire[i], L[i] + GCM_TAG);
+        if(gcm_recv(&dec, algo, bad, L[i], 1))
+            FAIL(name);
+        EXPECT(memcmp(bad, plain[i], L[i]) == 0);
+    }
+    ssh2_cipher_dtor(&dec);
+    have_dec = 0;
+
+    /* a failed tag check still advances the IV, so the next packet on
+       the same context pair decrypts */
+    if(ssh2_cipher_init(&dec, algo, iv, key, 0))
+        FAIL(name);
+    have_dec = 1;
+    memcpy(bad, wire[0], L[0] + GCM_TAG);
+    bad[L[0] + 3] ^= 0x01;
+    EXPECT(gcm_recv(&dec, algo, bad, L[0], 0) != 0);
+    memcpy(bad, wire[1], L[1] + GCM_TAG);
+    if(gcm_recv(&dec, algo, bad, L[1], 0))
+        FAIL(name);
+    EXPECT(memcmp(bad, plain[1], L[1]) == 0);
+    ssh2_cipher_dtor(&dec);
+    have_dec = 0;
+
+    /* MIDDLE or LAST with no FIRST before them */
+    if(ssh2_cipher_init(&dec, algo, iv, key, 0))
+        FAIL(name);
+    have_dec = 1;
+    memcpy(bad, wire[0], L[0] + GCM_TAG);
+    EXPECT(ssh2_cipher_crypt(&dec, algo, 0, bad, GCM_BS, MIDDLE_BLOCK) != 0);
+    EXPECT(ssh2_cipher_crypt(&dec, algo, 0, bad, 2 * GCM_BS,
+                             LAST_BLOCK) != 0);
     ssh2_cipher_dtor(&dec);
     have_dec = 0;
 
@@ -1234,7 +1434,7 @@ static int gcm_case(const char *name, SSH2_CIPHER_T(algo), size_t keylen)
     have_dec = 1;
     memcpy(bad, wire[0], L[0] + GCM_TAG);
     bad[L[0] + 3] ^= 0x01;
-    EXPECT(gcm_recv(&dec, algo, bad, L[0]) != 0);
+    EXPECT(gcm_recv(&dec, algo, bad, L[0], 0) != 0);
     ssh2_cipher_dtor(&dec);
     have_dec = 0;
 
@@ -1244,7 +1444,7 @@ static int gcm_case(const char *name, SSH2_CIPHER_T(algo), size_t keylen)
     have_dec = 1;
     memcpy(bad, wire[0], L[0] + GCM_TAG);
     bad[3] ^= 0x01;
-    EXPECT(gcm_recv(&dec, algo, bad, L[0]) != 0);
+    EXPECT(gcm_recv(&dec, algo, bad, L[0], 0) != 0);
     ssh2_cipher_dtor(&dec);
     have_dec = 0;
 
@@ -1254,7 +1454,7 @@ static int gcm_case(const char *name, SSH2_CIPHER_T(algo), size_t keylen)
     have_dec = 1;
     memcpy(bad, wire[0], L[0] + GCM_TAG);
     bad[20] ^= 0x01;
-    EXPECT(gcm_recv(&dec, algo, bad, L[0]) != 0);
+    EXPECT(gcm_recv(&dec, algo, bad, L[0], 0) != 0);
 
     rc = 0;
 
@@ -1319,6 +1519,7 @@ int main(int argc, char *argv[])
 #if LIBSSH2_AES_GCM
     rc |= test_aes_gcm();
 #endif
+    rc |= test_cipher_slots();
 
     libssh2_session_free(session);
 
