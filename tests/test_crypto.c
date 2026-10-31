@@ -198,6 +198,17 @@ static int check_rsa_from_components(LIBSSH2_SESSION *session,
     EXPECT(sig_len == ref_len && memcmp(sig, ref_sig, sig_len) == 0);
     EXPECT(rsa_verify_sha256(session, pub, sig, sig_len,
                              msg, sizeof(msg)) == 0);
+    SSH2_SAFEFREE(session, sig);
+    ssh2_rsa_free(key, session);
+    key = NULL;
+
+    /* OpenSSH-format keys carry no dP, dQ, qInv: they are derived */
+    EXPECT(ssh2_rsa_new(&key, session, c.e, c.elen, c.n, c.nlen,
+                        c.d, c.dlen, c.p, c.plen, c.q, c.qlen,
+                        NULL, 0, NULL, 0, NULL, 0) == 0);
+    EXPECT(rsa_sign_sha256(session, key, msg, sizeof(msg),
+                           &sig, &sig_len) == 0);
+    EXPECT(sig_len == ref_len && memcmp(sig, ref_sig, sig_len) == 0);
     rc = 0;
 
 fail:

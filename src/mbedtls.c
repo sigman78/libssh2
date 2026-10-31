@@ -436,11 +436,14 @@ static int mbed_bn_random(ssh2_bn *bn, int bits, int top, int bottom)
     buf = mbedtls_calloc(1, len);
     if(!buf)
         return -1;
+    /* the buffer holds the DH private exponent */
     if(psa_generate_random(buf, len) != PSA_SUCCESS ||
        mbedtls_mpi_read_binary(bn, buf, len)) {
+        mbedtls_platform_zeroize(buf, len);
         mbedtls_free(buf);
         return -1;
     }
+    mbedtls_platform_zeroize(buf, len);
     mbedtls_free(buf);
 
     /* Zero unused bits above the most significant bit */
@@ -557,6 +560,81 @@ static int mbed_pk_import(const mbedtls_pk_context *pk, psa_key_type_t type,
 
 #define MBED_RSA_ALG PSA_ALG_RSA_PKCS1V15_SIGN(PSA_ALG_ANY_HASH)
 
+/* A failed RSA import is blamed on the key size when PSA cannot take it:
+   it caps moduli at PSA_VENDOR_RSA_MAX_KEY_BITS and wants whole bytes. */
+static int mbed_rsa_size_err(LIBSSH2_SESSION *session, int errcode,
+                             size_t bits)
+{
+    char msg[96];
+
+    if(bits <= PSA_VENDOR_RSA_MAX_KEY_BITS && bits % 8 == 0)
+        return -1;
+    ssh2_snprintf(msg, sizeof(msg), "RSA keys larger than %d bits or of "
+                  "non-byte-aligned size are not supported",
+                  (int)PSA_VENDOR_RSA_MAX_KEY_BITS);
+    return ssh2_err_flags(session, errcode, msg, SSH2_ERR_FLAG_DUP);
+}
+
+/* The bit length of a big-endian unsigned number */
+static size_t mbed_uint_bits(const unsigned char *num, size_t len)
+{
+    unsigned int top;
+    size_t bits;
+
+    while(len && *num == 0) {
+        num++;
+        len--;
+    }
+    if(!len)
+        return 0;
+    bits = (len - 1) * 8;
+    for(top = *num; top; top >>= 1)
+        bits++;
+    return bits;
+}
+
+/* The CRT parameters RSAPrivateKey wants but a bare (n, e, d, p, q) set
+   lacks: dP = d mod (p-1), dQ = d mod (q-1), qInv = q^-1 mod p. The
+   outputs are plen, qlen and plen bytes. */
+static int mbed_rsa_crt(const unsigned char *d, size_t dlen,
+                        const unsigned char *p, size_t plen,
+                        const unsigned char *q, size_t qlen,
+                        unsigned char *dp, unsigned char *dq,
+                        unsigned char *qinv)
+{
+    mbedtls_mpi bd, bp, bq, t, r;
+    int ret = -1;
+
+    mbedtls_mpi_init(&bd);
+    mbedtls_mpi_init(&bp);
+    mbedtls_mpi_init(&bq);
+    mbedtls_mpi_init(&t);
+    mbedtls_mpi_init(&r);
+
+    if(mbedtls_mpi_read_binary(&bd, d, dlen) ||
+       mbedtls_mpi_read_binary(&bp, p, plen) ||
+       mbedtls_mpi_read_binary(&bq, q, qlen) ||
+       mbedtls_mpi_sub_int(&t, &bp, 1) ||
+       mbedtls_mpi_mod_mpi(&r, &bd, &t) ||
+       mbedtls_mpi_write_binary(&r, dp, plen) ||
+       mbedtls_mpi_sub_int(&t, &bq, 1) ||
+       mbedtls_mpi_mod_mpi(&r, &bd, &t) ||
+       mbedtls_mpi_write_binary(&r, dq, qlen) ||
+       mbedtls_mpi_inv_mod(&r, &bq, &bp) ||
+       mbedtls_mpi_write_binary(&r, qinv, plen))
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+
+    mbedtls_mpi_free(&bd);
+    mbedtls_mpi_free(&bp);
+    mbedtls_mpi_free(&bq);
+    mbedtls_mpi_free(&t);
+    mbedtls_mpi_free(&r);
+    return ret;
+}
+
 /* Writes an unsigned big-endian number as a DER INTEGER, backwards like
    the rest of asn1write. */
 static int mbed_asn1_write_uint(unsigned char **p, const unsigned char *start,
@@ -603,11 +681,29 @@ int ssh2_rsa_new(ssh2_rsa_ctx **rsa, LIBSSH2_SESSION *session,
          RSAPublicKey  ::= SEQUENCE { n, e }
          RSAPrivateKey ::= SEQUENCE { 0, n, e, d, p, q, dP, dQ, qInv } */
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
-    unsigned char *der, *ptr;
+    unsigned char *der, *ptr, *crt = NULL;
     size_t der_size, der_len;
     int ret = -1;
 
     *rsa = NULL;
+
+    /* OpenSSH-format keys carry only n, e, d, p, q */
+    if(ddata && pdata && qdata &&
+       (!e1data || !e1len || !e2data || !e2len || !coeffdata || !coefflen)) {
+        crt = SSH2_ALLOC(session, 2 * plen + qlen);
+        if(!crt ||
+           mbed_rsa_crt(ddata, dlen, pdata, plen, qdata, qlen,
+                        crt, crt + plen, crt + plen + qlen)) {
+            ssh2_zero_free(session, crt, 2 * plen + qlen);
+            return -1;
+        }
+        e1data = crt;
+        e1len = plen;
+        e2data = crt + plen;
+        e2len = qlen;
+        coeffdata = crt + plen + qlen;
+        coefflen = plen;
+    }
 
     /* an INTEGER costs at most 6 bytes of framing, the SEQUENCE 4 */
     der_size = elen + nlen + 3 * 6;
@@ -615,8 +711,10 @@ int ssh2_rsa_new(ssh2_rsa_ctx **rsa, LIBSSH2_SESSION *session,
         der_size += dlen + plen + qlen + e1len + e2len + coefflen + 7 * 6;
 
     der = SSH2_ALLOC(session, der_size);
-    if(!der)
+    if(!der) {
+        ssh2_zero_free(session, crt, 2 * plen + qlen);
         return -1;
+    }
     ptr = der + der_size;
 
     if(ddata &&
@@ -652,10 +750,14 @@ int ssh2_rsa_new(ssh2_rsa_ctx **rsa, LIBSSH2_SESSION *session,
     psa_set_key_algorithm(&attr, MBED_RSA_ALG);
     if(psa_import_key(&attr, ptr, der_len, *rsa) == PSA_SUCCESS)
         ret = 0;
+    else
+        ret = mbed_rsa_size_err(session, LIBSSH2_ERROR_INVAL,
+                                mbed_uint_bits(ndata, nlen));
 
 cleanup:
 
     ssh2_zero_free(session, der, der_size);
+    ssh2_zero_free(session, crt, 2 * plen + qlen);
     if(ret) {
         mbed_key_free(*rsa, session);
         *rsa = NULL;
@@ -678,10 +780,14 @@ int ssh2_rsa_new_priv(ssh2_rsa_ctx **rsa,
 
     mbedtls_pk_init(&pk);
     if(mbed_pk_parse(&pk, session, filename, blob, blob_len,
-                     passphrase) == 0 &&
-       mbed_pk_import(&pk, PSA_KEY_TYPE_RSA_KEY_PAIR, MBED_RSA_ALG,
-                      *rsa) == 0)
-        ret = 0;
+                     passphrase) == 0) {
+        if(mbed_pk_import(&pk, PSA_KEY_TYPE_RSA_KEY_PAIR, MBED_RSA_ALG,
+                          *rsa) == 0)
+            ret = 0;
+        else if(mbedtls_pk_get_type(&pk) == MBEDTLS_PK_RSA)
+            ret = mbed_rsa_size_err(session, LIBSSH2_ERROR_FILE,
+                                    mbedtls_pk_get_bitlen(&pk));
+    }
     mbedtls_pk_free(&pk);
 
     if(ret) {
@@ -854,13 +960,15 @@ cleanup:
 /* Copies the method name for the caller, frees the blob on failure */
 static int mbed_method_dup(LIBSSH2_SESSION *session, char **method,
                            const char *method_name,
-                           unsigned char **pubkeydata)
+                           unsigned char **pubkeydata,
+                           size_t *pubkeydata_len)
 {
     size_t method_len = strlen(method_name);
 
     *method = SSH2_ALLOC(session, method_len + 1);
     if(!*method) {
         SSH2_SAFEFREE(session, *pubkeydata);
+        *pubkeydata_len = 0;
         return -1;
     }
     memcpy(*method, method_name, method_len + 1);
@@ -1035,7 +1143,8 @@ static int mbed_ecdsa_openssh_pub(LIBSSH2_SESSION *session, char **method,
        mbed_ecdsa_names(bits, &method_name, &curve_name) == 0 &&
        mbed_ecdsa_pubkey(session, key, bits, pubkeydata,
                          pubkeydata_len) == 0) {
-        ret = mbed_method_dup(session, method, method_name, pubkeydata);
+        ret = mbed_method_dup(session, method, method_name, pubkeydata,
+                              pubkeydata_len);
     }
 
     psa_destroy_key(key);
@@ -1058,10 +1167,20 @@ static int mbed_pub_priv_key(LIBSSH2_SESSION *session, char **method,
     size_t bits;
     int ret;
 
-    /* a throwaway import: only the public half is read back */
-    if(mbedtls_pk_get_psa_attributes(pk, PSA_KEY_USAGE_SIGN_HASH, &attr) ||
+    /* a throwaway import of the public half: that is all that is read
+       back, and a verify-only request makes PSA derive the public key */
+    if(mbedtls_pk_get_psa_attributes(pk, PSA_KEY_USAGE_VERIFY_HASH, &attr) ||
        mbedtls_pk_import_into_psa(pk, &attr, &key)) {
+        size_t pk_bits = mbedtls_pk_get_type(pk) == MBEDTLS_PK_RSA ?
+                         mbedtls_pk_get_bitlen(pk) : 0;
         psa_reset_key_attributes(&attr);
+#if LIBSSH2_RSA
+        if(pk_bits) {
+            int err = mbed_rsa_size_err(session, LIBSSH2_ERROR_FILE, pk_bits);
+            if(err != -1)
+                return err;
+        }
+#endif
         return ssh2_err(session, LIBSSH2_ERROR_FILE, "Key type not supported");
     }
     type = psa_get_key_type(&attr);
@@ -1069,14 +1188,14 @@ static int mbed_pub_priv_key(LIBSSH2_SESSION *session, char **method,
     psa_reset_key_attributes(&attr);
 
 #if LIBSSH2_RSA
-    if(type == PSA_KEY_TYPE_RSA_KEY_PAIR) {
+    if(type == PSA_KEY_TYPE_RSA_PUBLIC_KEY) {
         method_name = "ssh-rsa";
         ret = mbed_rsa_pubkey(session, key, pubkeydata, pubkeydata_len);
     }
     else
 #endif
 #if LIBSSH2_ECDSA
-    if(PSA_KEY_TYPE_IS_ECC_KEY_PAIR(type) &&
+    if(PSA_KEY_TYPE_IS_ECC(type) &&
        PSA_KEY_TYPE_ECC_GET_FAMILY(type) == PSA_ECC_FAMILY_SECP_R1 &&
        mbed_ecdsa_names(bits, &method_name, &curve_name) == 0) {
         ret = mbed_ecdsa_pubkey(session, key, bits,
@@ -1087,7 +1206,8 @@ static int mbed_pub_priv_key(LIBSSH2_SESSION *session, char **method,
         ret = ssh2_err(session, LIBSSH2_ERROR_FILE, "Key type not supported");
 
     if(ret == 0)
-        ret = mbed_method_dup(session, method, method_name, pubkeydata);
+        ret = mbed_method_dup(session, method, method_name, pubkeydata,
+                              pubkeydata_len);
 
     psa_destroy_key(key);
     return ret;
