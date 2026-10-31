@@ -203,8 +203,10 @@ static int mbed_aead_crypt(ssh2_cipher_ctx *ctx, int encrypt,
     size_t cryptlen, olen;
     int ret = -1;
 
+    /* An oversized block still goes through fail: so an operation left
+       open by an earlier call is aborted, not resumed */
     if(blocksize > MBED_AEAD_MAX_BLOCK || blocksize < aadlen + taglen)
-        return -1;
+        goto fail;
 
     cryptlen = blocksize - aadlen - taglen;
 
@@ -331,7 +333,7 @@ void ssh2_cipher_dtor(ssh2_cipher_ctx *ctx)
         (void)psa_cipher_abort(&ctx->op.cipher);
 
     if(ctx->key != PSA_KEY_ID_NULL)
-        psa_destroy_key(ctx->key);
+        (void)psa_destroy_key(ctx->key);
 
     ssh2_explicit_zero(ctx, sizeof(*ctx));
 }

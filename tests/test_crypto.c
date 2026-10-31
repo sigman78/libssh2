@@ -1328,9 +1328,9 @@ static int gcm_case(const char *name, SSH2_CIPHER_T(algo), size_t keylen)
     unsigned char plain[2][4 + 16 * 5 + GCM_TAG];
     unsigned char wire[2][4 + 16 * 5 + GCM_TAG];
     unsigned char bad[4 + 16 * 5 + GCM_TAG];
-    ssh2_cipher_ctx enc, dec;
+    ssh2_cipher_ctx enc, enc2, dec;
     size_t L[2], i;
-    int have_enc = 0, have_dec = 0, rc = 1;
+    int have_enc = 0, have_enc2 = 0, have_dec = 0, rc = 1;
 
     EXPECT(ssh2_random(key, keylen) == 0);
     EXPECT(ssh2_random(iv, sizeof(iv)) == 0);
@@ -1417,6 +1417,28 @@ static int gcm_case(const char *name, SSH2_CIPHER_T(algo), size_t keylen)
     ssh2_cipher_dtor(&dec);
     have_dec = 0;
 
+    /* an oversized block aborts the open operation: the next small
+       MIDDLE has nothing to continue, and a new FIRST starts clean */
+    if(ssh2_cipher_init(&dec, algo, iv, key, 0))
+        FAIL(name);
+    have_dec = 1;
+    if(ssh2_cipher_init(&enc2, algo, iv, key, 1))
+        FAIL(name);
+    have_enc2 = 1;
+    memcpy(bad, wire[0], L[0] + GCM_TAG);
+    EXPECT(ssh2_cipher_crypt(&enc2, algo, 1, bad, GCM_BS, FIRST_BLOCK) == 0);
+    EXPECT(ssh2_cipher_crypt(&enc2, algo, 1, bad, 33, MIDDLE_BLOCK) != 0);
+    EXPECT(ssh2_cipher_crypt(&enc2, algo, 1, bad, GCM_BS,
+                             MIDDLE_BLOCK) != 0);
+    memcpy(bad, plain[0], L[0]);
+    if(gcm_send(&enc2, algo, bad, L[0]))
+        FAIL(name);
+    if(gcm_recv(&dec, algo, bad, L[0], 0))
+        FAIL(name);
+    EXPECT(memcmp(bad, plain[0], L[0]) == 0);
+    ssh2_cipher_dtor(&dec);
+    have_dec = 0;
+
     /* MIDDLE or LAST with no FIRST before them */
     if(ssh2_cipher_init(&dec, algo, iv, key, 0))
         FAIL(name);
@@ -1461,6 +1483,8 @@ static int gcm_case(const char *name, SSH2_CIPHER_T(algo), size_t keylen)
 fail:
     if(have_enc)
         ssh2_cipher_dtor(&enc);
+    if(have_enc2)
+        ssh2_cipher_dtor(&enc2);
     if(have_dec)
         ssh2_cipher_dtor(&dec);
     return rc;
