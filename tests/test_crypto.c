@@ -6,6 +6,11 @@
  * public key derivation, sign/verify, key agreement and ciphers.
  */
 
+#ifdef LIBSSH2_MBEDTLS
+/* mbedtls_psa_get_stats() fields are private */
+#define MBEDTLS_ALLOW_PRIVATE_ACCESS
+#endif
+
 #include "libssh2_priv.h"
 
 #include <stdio.h>
@@ -88,6 +93,7 @@ static int check_pub_privkey(LIBSSH2_SESSION *session, const char *name,
     if(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
                         NULL, priv, priv_len, passphrase))
         FAIL(name);
+    EXPECT(strcmp(method, expected_method) == 0);
     EXPECT(pubkey_len == expected_len);
     EXPECT(memcmp(pubkey, expected, expected_len) == 0);
 
@@ -102,6 +108,22 @@ fail:
     ssh2_zero_free(session, priv, priv_len);
     SSH2_FREE(session, expected);
     return rc;
+}
+
+/* Every PSA key the backend created must have been destroyed */
+static int check_no_key_slots(void)
+{
+#ifdef LIBSSH2_MBEDTLS
+    mbedtls_psa_stats_t stats;
+
+    mbedtls_psa_get_stats(&stats);
+    if(stats.MBEDTLS_PRIVATE(volatile_slots) != 0) {
+        fprintf(stderr, "%s:%d: %u PSA key slots leaked\n", __FILE__,
+                __LINE__, (unsigned)stats.MBEDTLS_PRIVATE(volatile_slots));
+        return 1;
+    }
+#endif
+    return 0;
 }
 
 static int flip_byte_verify_fails(int verify_rc)
@@ -499,6 +521,12 @@ static int test_rsa(LIBSSH2_SESSION *session)
     if(check_rsa_edges(session, blob, blob_len, priv, pub))
         goto fail;
 
+    ssh2_rsa_free(priv, session);
+    ssh2_rsa_free(pub, session);
+    priv = pub = NULL;
+    if(check_no_key_slots())
+        goto fail;
+
     rc = 0;
 
 fail:
@@ -530,9 +558,11 @@ static ssh2_hash_alg curve_hash(size_t bits, size_t *len)
 static int check_ecdh(LIBSSH2_SESSION *session, ssh2_curve_type curve,
                       size_t bits)
 {
-    ssh2_ec_key *a = NULL, *b = NULL;
-    unsigned char *pub_a = NULL, *pub_b = NULL, *ka = NULL, *kb = NULL;
-    size_t pub_a_len = 0, pub_b_len = 0, ka_len = 0, kb_len = 0;
+    ssh2_ec_key *a = NULL, *b = NULL, *c = NULL;
+    unsigned char *pub_a = NULL, *pub_b = NULL, *pub_c = NULL;
+    unsigned char *ka = NULL, *kb = NULL;
+    size_t pub_a_len = 0, pub_b_len = 0, pub_c_len = 0;
+    size_t ka_len = 0, kb_len = 0;
     ssh2_bn *k_a = NULL, *k_b = NULL;
     int rc = 1;
 
@@ -565,6 +595,13 @@ static int check_ecdh(LIBSSH2_SESSION *session, ssh2_curve_type curve,
     pub_b[pub_b_len - 1] ^= 1;
     EXPECT(ssh2_ecdh_gen_k(&k_a, session, a, pub_b, pub_b_len) != 0);
 
+    /* so must a well-formed point of another curve */
+    EXPECT(ssh2_ecdsa_create_key(&c, session, &pub_c, &pub_c_len,
+                                 curve == SSH2_EC_CURVE_NISTP256 ?
+                                 SSH2_EC_CURVE_NISTP384 :
+                                 SSH2_EC_CURVE_NISTP256) == 0);
+    EXPECT(ssh2_ecdh_gen_k(&k_a, session, a, pub_c, pub_c_len) != 0);
+
     rc = 0;
 
 fail:
@@ -574,8 +611,86 @@ fail:
     ssh2_bn_free(k_b);
     ssh2_ecdsa_free(a, session);
     ssh2_ecdsa_free(b, session);
+    ssh2_ecdsa_free(c, session);
     SSH2_FREE(session, pub_a);
     SSH2_FREE(session, pub_b);
+    SSH2_FREE(session, pub_c);
+    return rc;
+}
+
+/* An OpenSSH-made P-521 signature (id_ecdsa_openssh_signed-cert.pub, signed
+   by ca_user_ecdsa) carries an s with a 0x00 sign byte and a short value,
+   passed raw as hostkey.c does. */
+static int check_cert_signature(LIBSSH2_SESSION *session)
+{
+    unsigned char *cert = NULL, *ca = NULL;
+    unsigned char *str, *sig, *sigdata, *alg, *r, *s, *point;
+    size_t cert_len = 0, ca_len = 0, str_len, sig_len, sigdata_len;
+    size_t alg_len, r_len, s_len, point_len, signed_len, i;
+    struct string_buf buf, sbuf;
+    ssh2_ecdsa_ctx *ca_key = NULL;
+    ssh2_curve_type curve;
+    libssh2_uint64_t u64;
+    uint32_t u32;
+    int rc = 1;
+
+    EXPECT(read_pub_blob(session, "id_ecdsa_openssh_signed-cert",
+                         &cert, &cert_len) == 0);
+    buf.data = buf.dataptr = cert;
+    buf.len = cert_len;
+
+    /* type, nonce, curve, Q */
+    for(i = 0; i < 4; i++)
+        EXPECT(ssh2_get_string(&buf, &str, &str_len) == 0);
+    EXPECT(ssh2_get_u64(&buf, &u64) == 0);  /* serial */
+    EXPECT(ssh2_get_u32(&buf, &u32) == 0);  /* type */
+    /* key id, principals */
+    for(i = 0; i < 2; i++)
+        EXPECT(ssh2_get_string(&buf, &str, &str_len) == 0);
+    EXPECT(ssh2_get_u64(&buf, &u64) == 0);  /* valid after */
+    EXPECT(ssh2_get_u64(&buf, &u64) == 0);  /* valid before */
+    /* critical options, extensions, reserved, signature key */
+    for(i = 0; i < 4; i++)
+        EXPECT(ssh2_get_string(&buf, &str, &str_len) == 0);
+
+    signed_len = (size_t)(buf.dataptr - buf.data);
+    EXPECT(ssh2_get_string(&buf, &sig, &sig_len) == 0);
+    EXPECT(buf.dataptr == buf.data + buf.len);
+
+    sbuf.data = sbuf.dataptr = sig;
+    sbuf.len = sig_len;
+    EXPECT(ssh2_get_string(&sbuf, &alg, &alg_len) == 0);
+    EXPECT(alg_len == 19 && memcmp(alg, "ecdsa-sha2-nistp521", 19) == 0);
+    EXPECT(ssh2_get_string(&sbuf, &sigdata, &sigdata_len) == 0);
+    sbuf.data = sbuf.dataptr = sigdata;
+    sbuf.len = sigdata_len;
+    EXPECT(ssh2_get_string(&sbuf, &r, &r_len) == 0);
+    EXPECT(ssh2_get_string(&sbuf, &s, &s_len) == 0);
+    EXPECT(sbuf.dataptr == sbuf.data + sbuf.len);
+    EXPECT(s_len > 1 && s[0] == 0);  /* sign byte */
+
+    EXPECT(read_pub_blob(session, "ca_user_ecdsa", &ca, &ca_len) == 0);
+    sbuf.data = sbuf.dataptr = ca;
+    sbuf.len = ca_len;
+    EXPECT(ssh2_get_string(&sbuf, &alg, &alg_len) == 0);
+    EXPECT(ssh2_get_string(&sbuf, &str, &str_len) == 0);
+    EXPECT(ssh2_get_string(&sbuf, &point, &point_len) == 0);
+    EXPECT(ssh2_pem_ecdsa_curve_type_from_name(
+               (const char *)alg, alg_len, &curve) == 0);
+    EXPECT(ssh2_ecdsa_curve_name_with_octal_new(
+               &ca_key, session, point, point_len, curve) == 0);
+
+    EXPECT(ssh2_ecdsa_verify(ca_key, session, r, r_len, s, s_len,
+                             cert, signed_len) == 0);
+    EXPECT(ssh2_ecdsa_verify(ca_key, session, r, r_len, s, s_len,
+                             cert, signed_len - 1) != 0);
+
+    rc = 0;
+
+fail:
+    ssh2_ecdsa_free(ca_key, session);
+    SSH2_FREE(session, cert);
+    SSH2_FREE(session, ca);
     return rc;
 }
 
@@ -599,6 +714,11 @@ static int test_ecdsa(LIBSSH2_SESSION *session)
         { "id_ecdsa_pkcs8_encrypted", "libssh2", "ecdsa-sha2-nistp521", 521,
           SSH2_EC_CURVE_NISTP521 },
         { "id_ecdsa_openssh_encrypted", "libssh2", "ecdsa-sha2-nistp256", 256,
+          SSH2_EC_CURVE_NISTP256 },
+        /* OpenSSH format: 66-byte P-521 scalar padding, unencrypted P-256 */
+        { "ca_user_ecdsa", NULL, "ecdsa-sha2-nistp521", 521,
+          SSH2_EC_CURVE_NISTP521 },
+        { "ca_host_ecdsa", NULL, "ecdsa-sha2-nistp256", 256,
           SSH2_EC_CURVE_NISTP256 }
     };
     static const ssh2_curve_type curves[] = {
@@ -610,10 +730,12 @@ static int test_ecdsa(LIBSSH2_SESSION *session)
     unsigned char hash[SSH2_SHA512_DIG_LEN];
     ssh2_ecdsa_ctx *priv = NULL, *pub = NULL, *bad = NULL;
     unsigned char *blob = NULL, *sig = NULL;
-    unsigned char *name, *cname, *point, *r, *s;
+    unsigned char *name, *cname, *point, *r, *s, *r_raw, *s_raw;
+    unsigned char big[67];
     char *data = NULL;
     size_t blob_len = 0, sig_len = 0, name_len, cname_len, point_len;
-    size_t r_len, s_len, data_len = 0, hash_len, i;
+    size_t r_len, s_len, r_raw_len, s_raw_len, n_len;
+    size_t data_len = 0, hash_len, i;
     struct string_buf buf;
     ssh2_curve_type curve;
     int rc = 1;
@@ -661,6 +783,13 @@ static int test_ecdsa(LIBSSH2_SESSION *session)
                    &bad, session, point, point_len - 1, curve) != 0);
         EXPECT(!bad);
 
+        /* so must a point that belongs to another curve */
+        EXPECT(ssh2_ecdsa_curve_name_with_octal_new(
+                   &bad, session, point, point_len,
+                   curve == SSH2_EC_CURVE_NISTP384 ?
+                   SSH2_EC_CURVE_NISTP256 : SSH2_EC_CURVE_NISTP384) != 0);
+        EXPECT(!bad);
+
         /* sign and verify with the curve's hash */
         alg = curve_hash(keys[i].bits, &hash_len);
         EXPECT(ssh2_hash(alg, msg, sizeof(msg), hash, hash_len));
@@ -672,6 +801,15 @@ static int test_ecdsa(LIBSSH2_SESSION *session)
         EXPECT(ssh2_get_bignum_bytes(&buf, &r, &r_len) == 0);
         EXPECT(ssh2_get_bignum_bytes(&buf, &s, &s_len) == 0);
         EXPECT(buf.dataptr == buf.data + buf.len);
+
+        /* the same r and s as raw mpints, sign byte included */
+        buf.data = buf.dataptr = sig;
+        buf.len = sig_len;
+        EXPECT(ssh2_get_string(&buf, &r_raw, &r_raw_len) == 0);
+        EXPECT(ssh2_get_string(&buf, &s_raw, &s_raw_len) == 0);
+        EXPECT(ssh2_ecdsa_verify(pub, session, r_raw, r_raw_len,
+                                 s_raw, s_raw_len,
+                                 msg, sizeof(msg)) == 0);
 
         EXPECT(ssh2_ecdsa_verify(pub, session, r, r_len, s, s_len,
                                  msg, sizeof(msg)) == 0);
@@ -685,6 +823,24 @@ static int test_ecdsa(LIBSSH2_SESSION *session)
         EXPECT(ssh2_ecdsa_verify(pub, session, s, s_len, r, r_len,
                                  msg, sizeof(msg)) != 0);
 
+        /* r or s above the group order, or zero, must be refused */
+        n_len = (keys[i].bits + 7) / 8;
+        memset(big, 0xAA, sizeof(big));
+        big[0] = 1;
+        EXPECT(ssh2_ecdsa_verify(pub, session, big, n_len + 1, s, s_len,
+                                 msg, sizeof(msg)) != 0);
+        EXPECT(ssh2_ecdsa_verify(pub, session, r, r_len, big, n_len + 1,
+                                 msg, sizeof(msg)) != 0);
+        memset(big, 0, sizeof(big));
+        EXPECT(ssh2_ecdsa_verify(pub, session, big, 1, s, s_len,
+                                 msg, sizeof(msg)) != 0);
+        EXPECT(ssh2_ecdsa_verify(pub, session, r, r_len, big, 1,
+                                 msg, sizeof(msg)) != 0);
+
+        /* the digest must match the curve */
+        SSH2_SAFEFREE(session, sig);
+        EXPECT(ssh2_ecdsa_sign(priv, session, hash, 20,
+                               &sig, &sig_len) != 0);
         SSH2_SAFEFREE(session, sig);
         SSH2_SAFEFREE(session, blob);
         ssh2_ecdsa_free(priv, session);
@@ -706,6 +862,15 @@ static int test_ecdsa(LIBSSH2_SESSION *session)
     for(i = 0; i < sizeof(curves) / sizeof(curves[0]); i++)
         if(check_ecdh(session, curves[i], curve_bits[i]))
             goto fail;
+
+    if(check_cert_signature(session))
+        goto fail;
+
+    ssh2_ecdsa_free(priv, session);
+    ssh2_ecdsa_free(pub, session);
+    priv = pub = NULL;
+    if(check_no_key_slots())
+        goto fail;
 
     rc = 0;
 
