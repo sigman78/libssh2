@@ -52,7 +52,6 @@
 #include <psa/crypto_config.h>
 #include <psa/crypto.h>
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
-#include <mbedtls/rsa.h>
 #include <mbedtls/bignum.h>
 #include <mbedtls/cipher.h>
 #ifdef MBEDTLS_GCM_C
@@ -67,6 +66,8 @@
 #include <mbedtls/psa_util.h>  /* mbedtls_psa_get_random() */
 #endif
 #include <mbedtls/pk.h>
+#include <mbedtls/asn1.h>
+#include <mbedtls/asn1write.h>
 #include <mbedtls/error.h>
 
 /* Define which features are supported. */
@@ -152,7 +153,8 @@ struct mbed_hash_ctx {
  * mbedTLS backend: RSA functions
  */
 
-#define ssh2_rsa_ctx           mbedtls_rsa_context
+/* Keys live in the PSA key store; a context is a heap-held key id. */
+#define ssh2_rsa_ctx           psa_key_id_t
 
 /*******************************************************************/
 /*
