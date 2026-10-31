@@ -71,13 +71,21 @@ set(_sources ${CSOURCES} ${HHEADERS})
 # Vendored Monocypher (ed25519/x25519) is only needed by the mbedTLS backend.
 if(CRYPTO_BACKEND STREQUAL "mbedTLS")
   list(APPEND _sources ${MONOCYPHER_CSOURCES})
-  # It is C99 and not ours to fix: exempt it from our picky warnings.
-  if(MSVC)
+  # It is C99 (CI builds some jobs with -std=gnu90) and not ours to fix:
+  # build it as C99 and exempt it from our picky warnings, and keep it out
+  # of unity batches that would carry those options over to other files.
+  set_source_files_properties(${MONOCYPHER_CSOURCES}
+    PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+  if(MSVC AND CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+    # -w would clash with -W4 (D9025), so silence what it triggers (u64 to u32)
     set_source_files_properties(${MONOCYPHER_CSOURCES}
-      PROPERTIES COMPILE_OPTIONS "-wd4242;-wd4244")  # u64 to u32
-  else()
+      PROPERTIES COMPILE_OPTIONS "-wd4242;-wd4244")
+  elseif(MSVC)  # clang-cl: accepts -w, and MSVC-style flags select C17
     set_source_files_properties(${MONOCYPHER_CSOURCES}
       PROPERTIES COMPILE_OPTIONS "-w")
+  else()
+    set_source_files_properties(${MONOCYPHER_CSOURCES}
+      PROPERTIES COMPILE_OPTIONS "-std=gnu99;-w")
   endif()
 endif()
 

@@ -6,6 +6,7 @@ AUTOMAKE_OPTIONS = foreign nostdinc
 include Makefile.inc
 
 libssh2_la_SOURCES = $(CSOURCES) $(HHEADERS)
+# Monocypher is C99: autotools builds need a C99 compiler (not -std=gnu90)
 if USE_MONOCYPHER
 libssh2_la_SOURCES += $(MONOCYPHER_CSOURCES)
 endif

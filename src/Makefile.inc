@@ -20,8 +20,6 @@ CSOURCES =              \
   mac.c                 \
   mbedtls.c             \
   misc.c                \
-  monocypher-ed25519.c  \
-  monocypher.c          \
   openssl.c             \
   os400qc3.c            \
   packet.c              \
