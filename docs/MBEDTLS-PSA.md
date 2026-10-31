@@ -104,11 +104,11 @@ is no PSA way around it.
   ships no implementation. ed25519 host keys, user keys and the
   `curve25519-sha256` KEX therefore use the vendored Monocypher 4.0.2
   (`src/monocypher*.c`), independent of the Mbed TLS build. The files are
-  compiled only for the mbedTLS backend (CMake and automake), excluded from
-  `scripts/checksrc-all.pl`, and written in C99: CMake builds them with
-  `-std=gnu99 -w` (no unity batching), automake has no per-file flags and
-  needs a C99 compiler, and licensed BSD-2-Clause OR CC0-1.0 (both texts
-  are under `LICENSES/`). X25519 could move to PSA
+  licensed BSD-2-Clause OR CC0-1.0 (both texts are under `LICENSES/`),
+  compiled only for the mbedTLS backend (CMake and automake), and excluded
+  from `scripts/checksrc-all.pl`. They are C99: CMake builds them with
+  `-std=gnu99 -w` outside any unity batch; automake has no per-file flags,
+  so an autotools build needs a C99 compiler. X25519 could move to PSA
   (`PSA_WANT_ECC_MONTGOMERY_255` is on by default); it stays on Monocypher to
   keep one code path per curve. The shared secret is rejected when it is all
   zero, as RFC 8731 requires.
