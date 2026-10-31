@@ -275,10 +275,10 @@ jobs:
       BORINGSSL_SHA256: fb43aac7fbd323c9dfa1f45fe92a1c01142433c05b23fe34f61d6ba8b13b642e
       LIBRESSL_VERSION: 4.4.0
       LIBRESSL_SHA256: 7d02522ad5070b9adb32eb253ecabce181184a3750cf65abac0675ee908687c1
-      MBEDTLS_VERSION: 3.6.7
-      MBEDTLS_SHA256: a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6
-      MBEDTLS_VERSION_PREV: 3.1.0
-      MBEDTLS_SHA256_PREV: b02df6f68dd1537e115a8497d5c173dc71edc55ad084756e57a30f951b725acd
+      MBEDTLS_VERSION: 4.0.0
+      MBEDTLS_SHA256: 2f3a47f7b3a541ddef450e4867eeecb7ce2ef7776093f3a11d6d43ead6bf2827
+      MBEDTLS_VERSION_PREV: 3.6.0
+      MBEDTLS_SHA256_PREV: 3ecf94fcfdaacafb757786a01b7538a61750ebd85c4b024f56ff8ba1490fcd38
       OPENSSL_VERSION: 4.1.0
       OPENSSL_SHA256: 50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd
       OPENSSL111_VERSION: 1.1.1w
@@ -414,8 +414,8 @@ jobs:
         if: ${{ matrix.crypto == 'mbedTLS-prev' && !steps.cache-mbedtls-prev.outputs.cache-hit }}
         run: |
           curl --disable --fail --silent --show-error --connect-timeout 15 --max-time 120 --retry 6 --retry-connrefused \
-            --location --proto-redir =https "https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v${MBEDTLS_VERSION_PREV}.tar.gz" --output pkg.bin
-          sha256sum pkg.bin | tee /dev/stderr | grep -qwF -- "${MBEDTLS_SHA256_PREV}" && tar -xzf pkg.bin && rm -f pkg.bin
+            --location --proto-redir =https "https://github.com/Mbed-TLS/mbedtls/releases/download/v${MBEDTLS_VERSION_PREV}/mbedtls-${MBEDTLS_VERSION_PREV}.tar.bz2" --output pkg.bin
+          sha256sum pkg.bin | tee /dev/stderr | grep -qwF -- "${MBEDTLS_SHA256_PREV}" && tar -xjf pkg.bin && rm -f pkg.bin
           cd "mbedtls-${MBEDTLS_VERSION_PREV}"
           export CC=gcc  # compiler warning promoted to error when using clang (as tested with 3.0.0/3.1.0)
           cmake -B . -G Ninja \
