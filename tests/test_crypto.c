@@ -1070,6 +1070,250 @@ fail:
     return rc;
 }
 
+/* PEM text of a DER blob, 64 columns */
+static int make_pem(LIBSSH2_SESSION *session, const char *label,
+                    const unsigned char *der, size_t der_len,
+                    char **out, size_t *out_len)
+{
+    char *b64 = NULL, *pem, *p;
+    size_t b64_len, label_len = strlen(label), i, n;
+
+    b64_len = ssh2_base64_encode(session, (const char *)der, der_len, &b64);
+    if(!b64_len)
+        return 1;
+    pem = SSH2_ALLOC(session, 2 * label_len + 40 + b64_len + b64_len / 64);
+    if(!pem) {
+        SSH2_FREE(session, b64);
+        return 1;
+    }
+    p = pem;
+    memcpy(p, "-----BEGIN ", 11);
+    p += 11;
+    memcpy(p, label, label_len);
+    p += label_len;
+    memcpy(p, "-----\n", 6);
+    p += 6;
+    for(i = 0; i < b64_len; i += n) {
+        n = b64_len - i < 64 ? b64_len - i : 64;
+        memcpy(p, b64 + i, n);
+        p += n;
+        *p++ = '\n';
+    }
+    memcpy(p, "-----END ", 9);
+    p += 9;
+    memcpy(p, label, label_len);
+    p += label_len;
+    memcpy(p, "-----\n", 6);
+    p += 6;
+    SSH2_FREE(session, b64);
+    *out = pem;
+    *out_len = (size_t)(p - pem);
+    return 0;
+}
+
+/* The binary body of a PEM-like blob */
+static int unwrap_pem(LIBSSH2_SESSION *session, const char *pem,
+                      size_t pem_len, unsigned char **der, size_t *der_len)
+{
+    char *body, *p;
+    size_t i = 0;
+    int rc;
+
+    body = p = SSH2_ALLOC(session, pem_len + 1);
+    if(!body)
+        return 1;
+    while(i < pem_len) {
+        if(pem[i] == '-') {
+            while(i < pem_len && pem[i] != '\n')
+                i++;
+            continue;
+        }
+        if(pem[i] != '\n' && pem[i] != '\r')
+            *p++ = pem[i];
+        i++;
+    }
+    rc = ssh2_base64_decode(session, (char **)der, der_len, body,
+                            (size_t)(p - body));
+    SSH2_FREE(session, body);
+    return rc;
+}
+
+/* RFC 8032 section 7.1: sign with a PKCS#8 key built in memory */
+static int check_ed25519_sign_kat(LIBSSH2_SESSION *session,
+                                  const char *seed_hex,
+                                  const char *msg_hex, size_t msg_len,
+                                  const char *sig_hex)
+{
+    static const unsigned char head[] = {
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+        0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20
+    };
+    unsigned char der[sizeof(head) + SSH2_ED25519_KEY_LEN], msg[1];
+    unsigned char want[SSH2_ED25519_SIG_LEN];
+    ssh2_ed25519_ctx *priv = NULL;
+    uint8_t *sig = NULL;
+    size_t sig_len = 0, pem_len = 0;
+    char *pem = NULL;
+    int rc = 1;
+
+    EXPECT(msg_len <= sizeof(msg));
+    memcpy(der, head, sizeof(head));
+    EXPECT(hex_decode(seed_hex, der + sizeof(head),
+                      SSH2_ED25519_KEY_LEN) == 0);
+    EXPECT(hex_decode(msg_hex, msg, msg_len) == 0);
+    EXPECT(hex_decode(sig_hex, want, sizeof(want)) == 0);
+    EXPECT(make_pem(session, "PRIVATE KEY", der, sizeof(der),
+                    &pem, &pem_len) == 0);
+
+    EXPECT(ssh2_ed25519_new_priv(&priv, session, NULL, pem, pem_len,
+                                 NULL) == 0);
+    EXPECT(ssh2_ed25519_sign(priv, session, &sig, &sig_len, msg,
+                             msg_len) == 0);
+    EXPECT(sig_len == sizeof(want));
+    EXPECT(memcmp(sig, want, sizeof(want)) == 0);
+    rc = 0;
+
+fail:
+    SSH2_FREE(session, sig);
+    ssh2_zero_free(session, pem, pem_len);
+    ssh2_ed25519_free(priv, session);
+    return rc;
+}
+
+/* RFC 7748 section 6.1: K is a bignum, so leading zero bytes are gone */
+static int check_x25519_kat(const char *priv_hex, const char *pub_hex,
+                            const char *shared_hex)
+{
+    uint8_t priv[SSH2_ED25519_KEY_LEN], pub[SSH2_ED25519_KEY_LEN];
+    unsigned char want[SSH2_ED25519_KEY_LEN], got[SSH2_ED25519_KEY_LEN];
+    ssh2_bn *k = NULL;
+    size_t skip = 0;
+    int rc = 1;
+
+    EXPECT(hex_decode(priv_hex, priv, sizeof(priv)) == 0);
+    EXPECT(hex_decode(pub_hex, pub, sizeof(pub)) == 0);
+    EXPECT(hex_decode(shared_hex, want, sizeof(want)) == 0);
+    while(skip < sizeof(want) && want[skip] == 0)
+        skip++;
+
+    k = ssh2_bn_init();
+    EXPECT(k);
+    EXPECT(ssh2_curve25519_gen_k(&k, priv, pub) == 0);
+    EXPECT(ssh2_bn_bytes(k) == sizeof(want) - skip);
+    ssh2_bn_to_bin(k, got);
+    EXPECT(memcmp(got, want + skip, sizeof(want) - skip) == 0);
+    rc = 0;
+
+fail:
+    ssh2_bn_free(k);
+    return rc;
+}
+
+/* The public half is stored three times in an unencrypted OpenSSH
+   ed25519 key: the envelope, the private section, and after the seed.
+   A copy that disagrees with the others must be refused. */
+static int check_openssh_envelope(LIBSSH2_SESSION *session)
+{
+    unsigned char *pubblob = NULL, *der = NULL, *p, *end;
+    unsigned char *pub, *alg;
+    char *file = NULL, *pem = NULL, *method = NULL;
+    unsigned char *pubkey = NULL;
+    size_t pubblob_len = 0, der_len = 0, file_len = 0, pem_len = 0;
+    size_t alg_len, pub_len, pubkey_len = 0;
+    struct string_buf buf;
+    ssh2_ed25519_ctx *key = NULL;
+    int found = 0, rc = 1;
+
+    EXPECT(read_pub_blob(session, "id_ed25519_openssh",
+                         &pubblob, &pubblob_len) == 0);
+    buf.data = buf.dataptr = pubblob;
+    buf.len = pubblob_len;
+    EXPECT(ssh2_get_string(&buf, &alg, &alg_len) == 0);
+    EXPECT(ssh2_get_string(&buf, &pub, &pub_len) == 0);
+    EXPECT(pub_len == SSH2_ED25519_KEY_LEN);
+
+    EXPECT(ssh2_file_to_blob(session, keypath("id_ed25519_openssh"),
+                             &file, &file_len) == 0);
+    EXPECT(unwrap_pem(session, file, file_len, &der, &der_len) == 0);
+
+    /* the untouched key survives the round trip through our encoder */
+    EXPECT(make_pem(session, "OPENSSH PRIVATE KEY", der, der_len,
+                    &pem, &pem_len) == 0);
+    EXPECT(ssh2_ed25519_new_priv(&key, session, NULL, pem, pem_len,
+                                 NULL) == 0);
+    ssh2_ed25519_free(key, session);
+    key = NULL;
+    ssh2_zero_free(session, pem, pem_len);
+    pem = NULL;
+
+    /* flip the second copy, the one inside the private section */
+    end = der + der_len - SSH2_ED25519_KEY_LEN;
+    for(p = der; p <= end; p++) {
+        if(memcmp(p, pub, SSH2_ED25519_KEY_LEN) == 0 && ++found == 2) {
+            p[0] ^= 1;
+            break;
+        }
+    }
+    EXPECT(found == 2);
+    EXPECT(make_pem(session, "OPENSSH PRIVATE KEY", der, der_len,
+                    &pem, &pem_len) == 0);
+
+    EXPECT(ssh2_ed25519_new_priv(&key, session, NULL, pem, pem_len,
+                                 NULL) != 0);
+    EXPECT(!key);
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            NULL, pem, pem_len, NULL) != 0);
+    EXPECT(!method && !pubkey && pubkey_len == 0);
+    rc = 0;
+
+fail:
+    SSH2_FREE(session, pubblob);
+    ssh2_zero_free(session, der, der_len);
+    ssh2_zero_free(session, file, file_len + 1);
+    ssh2_zero_free(session, pem, pem_len);
+    ssh2_ed25519_free(key, session);
+    return rc;
+}
+
+#ifdef LIBSSH2_MBEDTLS
+/* Keys this backend cannot use must fail cleanly, with the right error */
+static int check_pub_privkey_errors(LIBSSH2_SESSION *session)
+{
+    static const char garbage[] = "this is not a private key\n";
+    char *method = NULL;
+    unsigned char *pubkey = NULL;
+    size_t pubkey_len = 0;
+    int rc = 1;
+
+    /* OpenSSH-format RSA */
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            keypath("id_rsa_openssh"), NULL, 0, NULL) != 0);
+    EXPECT(!method && !pubkey && pubkey_len == 0);
+
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            NULL, garbage, sizeof(garbage) - 1, NULL) != 0);
+    EXPECT(!method && !pubkey && pubkey_len == 0);
+
+    /* encrypted PKCS#8 ed25519: the pk parser cannot decrypt that */
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            keypath("id_ed25519_pkcs8_encrypted"), NULL, 0,
+                            "libssh2") != 0);
+    EXPECT(!method && !pubkey && pubkey_len == 0);
+
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            keypath("id_ed25519_openssh_encrypted"),
+                            NULL, 0, "wrong") ==
+           LIBSSH2_ERROR_KEYFILE_AUTH_FAILED);
+    EXPECT(!method && !pubkey && pubkey_len == 0);
+    rc = 0;
+
+fail:
+    SSH2_FREE(session, method);
+    SSH2_FREE(session, pubkey);
+    return rc;
+}
+#endif
+
 static int test_ed25519(LIBSSH2_SESSION *session)
 {
     /* id_ed25519_pkcs8_encrypted is left out: encrypted PKCS#8 */
@@ -1190,10 +1434,41 @@ static int test_ed25519(LIBSSH2_SESSION *session)
            "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"))
         goto fail;
 
+    if(check_ed25519_sign_kat(
+           session,
+           "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+           "", 0,
+           "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+           "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"))
+        goto fail;
+    if(check_ed25519_sign_kat(
+           session,
+           "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+           "72", 1,
+           "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+           "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"))
+        goto fail;
+
     if(check_ed25519_cert(session))
         goto fail;
 
+    if(check_openssh_envelope(session))
+        goto fail;
+#ifdef LIBSSH2_MBEDTLS
+    if(check_pub_privkey_errors(session))
+        goto fail;
+#endif
+
     if(check_curve25519(session))
+        goto fail;
+    if(check_x25519_kat(
+           "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+           "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+           "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+       || check_x25519_kat(
+           "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+           "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+           "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"))
         goto fail;
 
     if(check_no_key_slots())
