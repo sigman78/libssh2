@@ -42,7 +42,6 @@
 #endif
 #include <mbedtls/platform.h>
 #include <mbedtls/platform_util.h>
-#include <psa/crypto_config.h>
 #include <psa/crypto.h>
 #if !(defined(PSA_WANT_ALG_ECDSA) && PSA_WANT_ALG_ECDSA && \
       defined(PSA_WANT_ALG_ECDH) && PSA_WANT_ALG_ECDH && \
@@ -107,15 +106,7 @@
 #define LIBSSH2_RSA_SHA1 1
 #define LIBSSH2_RSA_SHA2 1
 #define LIBSSH2_DSA 0
-#if defined(PSA_WANT_ALG_ECDSA) && PSA_WANT_ALG_ECDSA && \
-    defined(PSA_WANT_ALG_ECDH) && PSA_WANT_ALG_ECDH && \
-    defined(PSA_WANT_ECC_SECP_R1_256) && PSA_WANT_ECC_SECP_R1_256 && \
-    defined(PSA_WANT_ECC_SECP_R1_384) && PSA_WANT_ECC_SECP_R1_384 && \
-    defined(PSA_WANT_ECC_SECP_R1_521) && PSA_WANT_ECC_SECP_R1_521
-#define LIBSSH2_ECDSA 1
-#else
-#define LIBSSH2_ECDSA 0
-#endif
+#define LIBSSH2_ECDSA 1  /* guaranteed by the #error above */
 #define LIBSSH2_ED25519 0
 #define LIBSSH2_MLKEM 0
 
