@@ -12,7 +12,8 @@ is the binary ASN.1 encoding used by PKCS#1 and PKCS#8 key files. CRT means
 the Chinese remainder theorem parameters of an RSA private key. AEAD is
 authenticated encryption with associated data. GCM is the Galois/Counter mode
 of AES. KEX is the SSH key exchange. DRBG is a deterministic random bit
-generator.
+generator. PKCS is the Public-Key Cryptography Standards family. PEM is the
+base64 text armour around DER.
 
 ## Why
 
@@ -35,13 +36,25 @@ one of those. The PSA port removes all of them except one, described under
   later) moves the result into PSA. That is why the minimum version is 3.6.0.
   OpenSSH-format private keys (`openssh-key-v1`) are parsed by libssh2 itself
   and imported as raw material: the ECDSA case imports the scalar, the
-  ed25519 case needs no PSA at all. `ssh2_pub_privkey()` tries the pk parser
-  first and then one OpenSSH-format fallback that decrypts the envelope once
-  and dispatches on the key type, so the envelope parser's own error (for
-  example a wrong passphrase) reaches the caller. Unencrypted PKCS#8 ed25519
-  keys are recognised by their fixed DER prefix; encrypted PKCS#8 ed25519 is
-  not supported because the pk parser cannot decrypt a key type it does not
-  know.
+  ed25519 case needs no PSA at all. One dispatcher, `mbed_openssh_load()`,
+  decrypts the envelope once and hands the body to the importer for its key
+  type; `ssh2_ecdsa_new_priv()`, `ssh2_ed25519_new_priv()` and
+  `ssh2_pub_privkey()` all go through it, so the envelope parser's own error
+  reaches every caller. A wrong passphrase is
+  `LIBSSH2_ERROR_KEYFILE_AUTH_FAILED` (authenticated ciphers report a failed
+  decrypt, which is mapped to it). The header may follow other lines, as in
+  the envelope parser; the comment and the padding bytes are checked and the
+  decrypted envelope is wiped before release. Unencrypted PKCS#8 ed25519 keys
+  are recognised by their fixed DER prefix. Encrypted PKCS#8 ed25519 is not
+  supported, because the pk parser cannot decrypt a key type it does not
+  know; the Docker test `test_auth_pubkey_ok_ed25519_pkcs8_encrypted` is
+  skipped for this backend. OpenSSH-format RSA is not supported either.
+* **No dependency on the TLS library.** Parser errors are mapped by hand
+  (`mbed_pk_err()`) instead of `mbedtls_strerror()`, which lives in
+  libmbedtls on Mbed TLS 4. Linking `tfpsacrypto` (or `mbedcrypto` on 3.x)
+  alone is enough, also for a manual `find_library` or pkg-config setup; a
+  static `tfpsacrypto` on Windows additionally needs `bcrypt`, which
+  `cmake/FindMbedTLS.cmake` adds.
 * **The throwaway import for public key derivation uses the key pair.** A
   public-only import of a parsed RSA private key fails on Mbed TLS 4 because
   its RSA parser does not fill `pk->pub_raw`. The pair is imported and the
@@ -92,7 +105,9 @@ is no PSA way around it.
   `curve25519-sha256` KEX therefore use the vendored Monocypher 4.0.2
   (`src/monocypher*.c`), independent of the Mbed TLS build. The files are
   compiled only for the mbedTLS backend (CMake and automake), excluded from
-  `scripts/checksrc-all.pl`, and licensed BSD-2-Clause OR CC0-1.0 (both texts
+  `scripts/checksrc-all.pl`, and written in C99: CMake builds them with
+  `-std=gnu99 -w` (no unity batching), automake has no per-file flags and
+  needs a C99 compiler, and licensed BSD-2-Clause OR CC0-1.0 (both texts
   are under `LICENSES/`). X25519 could move to PSA
   (`PSA_WANT_ECC_MONTGOMERY_255` is on by default); it stays on Monocypher to
   keep one code path per curve. The shared secret is rejected when it is all
@@ -152,13 +167,17 @@ using the fixtures under `tests/keys`. It covers key loading from file and
 memory in PEM, PKCS#8, OpenSSH and encrypted variants; public key derivation
 compared byte-for-byte with the `ssh-keygen` `.pub` files; sign and verify
 with raw mpint inputs including sign bytes and short values; OpenSSH-made
-P-521 and ed25519 certificate signatures; RFC 8032 ed25519 vectors; ECDH and
-X25519 agreement including the low-order point refusals; NIST SP 800-38A CTR and CBC
+P-521 and ed25519 certificate signatures; RFC 8032 ed25519 vectors, signed
+through an in-memory PKCS#8 key; ECDH and X25519 agreement including the
+low-order point refusals and the RFC 7748 known answer; OpenSSH envelopes
+with disagreeing public halves and the `ssh2_pub_privkey()` error codes; NIST SP 800-38A CTR and CBC
 vectors; RFC 4231 HMAC and SHA-256 known answers; the exact transport
 chunking for AES-GCM over consecutive packets, cross-checked against
 single-shot `psa_aead_encrypt()`; refusal cases; and PSA key slot hygiene.
 Every tests commit on the branch was first run against the legacy code it
 replaces, so the tests describe the contract rather than the implementation.
+The file is built by every crypto backend; cases a backend lacks (PKCS#8,
+encrypted PEM, short RSA signatures) are guarded, and WinCNG passes it.
 
 The branch builds and passes on Mbed TLS 3.6.7 and on Mbed TLS 4.0.0 with
 TF-PSA-Crypto 1.0.0 (Windows, MSVC). Interoperability against a live sshd and
