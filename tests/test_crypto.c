@@ -338,9 +338,9 @@ static int test_ecdsa(LIBSSH2_SESSION *session)
     for(i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         ssh2_hash_alg alg;
 
-        /* the mbedTLS backend cannot derive ECDSA public keys yet, so
-           take the wire blob from the .pub file */
-        if(read_pub_blob(session, keys[i].name, &blob, &blob_len))
+        /* public key derivation, from file and from memory */
+        if(check_pub_privkey(session, keys[i].name, keys[i].passphrase,
+                             keys[i].method, &blob, &blob_len))
             goto fail;
 
         /* private key loading, file and memory */
