@@ -228,6 +228,214 @@ fail:
 }
 #endif /* LIBSSH2_RSA */
 
+#if LIBSSH2_ECDSA
+static ssh2_hash_alg curve_hash(size_t bits, size_t *len)
+{
+    if(bits == 256) {
+        *len = SSH2_SHA256_DIG_LEN;
+        return SSH2_SHA256_ALG;
+    }
+    if(bits == 384) {
+        *len = SSH2_SHA384_DIG_LEN;
+        return SSH2_SHA384_ALG;
+    }
+    *len = SSH2_SHA512_DIG_LEN;
+    return SSH2_SHA512_ALG;
+}
+
+/* Two parties derive the same K from well-formed points */
+static int check_ecdh(LIBSSH2_SESSION *session, ssh2_curve_type curve,
+                      size_t bits)
+{
+    ssh2_ec_key *a = NULL, *b = NULL;
+    unsigned char *pub_a = NULL, *pub_b = NULL, *ka = NULL, *kb = NULL;
+    size_t pub_a_len = 0, pub_b_len = 0, ka_len = 0, kb_len = 0;
+    ssh2_bn *k_a = NULL, *k_b = NULL;
+    int rc = 1;
+
+    EXPECT(ssh2_ecdsa_create_key(&a, session, &pub_a, &pub_a_len,
+                                 curve) == 0);
+    EXPECT(ssh2_ecdsa_create_key(&b, session, &pub_b, &pub_b_len,
+                                 curve) == 0);
+    EXPECT(pub_a_len == 1 + 2 * ((bits + 7) / 8));
+    EXPECT(pub_b_len == pub_a_len);
+    EXPECT(pub_a[0] == 0x04 && pub_b[0] == 0x04);
+    EXPECT(memcmp(pub_a, pub_b, pub_a_len) != 0);
+
+    k_a = ssh2_bn_init();
+    k_b = ssh2_bn_init();
+    EXPECT(k_a && k_b);
+    EXPECT(ssh2_ecdh_gen_k(&k_a, session, a, pub_b, pub_b_len) == 0);
+    EXPECT(ssh2_ecdh_gen_k(&k_b, session, b, pub_a, pub_a_len) == 0);
+
+    ka_len = ssh2_bn_bytes(k_a);
+    kb_len = ssh2_bn_bytes(k_b);
+    EXPECT(ka_len > 0 && ka_len == kb_len);
+    ka = SSH2_ALLOC(session, ka_len);
+    kb = SSH2_ALLOC(session, kb_len);
+    EXPECT(ka && kb);
+    ssh2_bn_to_bin(k_a, ka);
+    ssh2_bn_to_bin(k_b, kb);
+    EXPECT(memcmp(ka, kb, ka_len) == 0);
+
+    /* a point that is not on the curve must be refused */
+    pub_b[pub_b_len - 1] ^= 1;
+    EXPECT(ssh2_ecdh_gen_k(&k_a, session, a, pub_b, pub_b_len) != 0);
+
+    rc = 0;
+
+fail:
+    ssh2_zero_free(session, ka, ka_len);
+    ssh2_zero_free(session, kb, kb_len);
+    ssh2_bn_free(k_a);
+    ssh2_bn_free(k_b);
+    ssh2_ecdsa_free(a, session);
+    ssh2_ecdsa_free(b, session);
+    SSH2_FREE(session, pub_a);
+    SSH2_FREE(session, pub_b);
+    return rc;
+}
+
+static int test_ecdsa(LIBSSH2_SESSION *session)
+{
+    static const struct {
+        const char *name;
+        const char *passphrase;
+        const char *method;
+        size_t bits;
+        ssh2_curve_type curve;
+    } keys[] = {
+        { "id_ecdsa_pem", NULL, "ecdsa-sha2-nistp521", 521,
+          SSH2_EC_CURVE_NISTP521 },
+        { "id_ecdsa_pkcs8", NULL, "ecdsa-sha2-nistp384", 384,
+          SSH2_EC_CURVE_NISTP384 },
+        { "id_ecdsa_openssh", NULL, "ecdsa-sha2-nistp384", 384,
+          SSH2_EC_CURVE_NISTP384 },
+        { "id_ecdsa_pem_encrypted", "libssh2", "ecdsa-sha2-nistp256", 256,
+          SSH2_EC_CURVE_NISTP256 },
+        { "id_ecdsa_pkcs8_encrypted", "libssh2", "ecdsa-sha2-nistp521", 521,
+          SSH2_EC_CURVE_NISTP521 },
+        { "id_ecdsa_openssh_encrypted", "libssh2", "ecdsa-sha2-nistp256", 256,
+          SSH2_EC_CURVE_NISTP256 }
+    };
+    static const ssh2_curve_type curves[] = {
+        SSH2_EC_CURVE_NISTP256, SSH2_EC_CURVE_NISTP384, SSH2_EC_CURVE_NISTP521
+    };
+    static const size_t curve_bits[] = { 256, 384, 521 };
+    const unsigned char msg[] = "the quick brown fox";
+    unsigned char tampered[sizeof(msg)];
+    unsigned char hash[SSH2_SHA512_DIG_LEN];
+    ssh2_ecdsa_ctx *priv = NULL, *pub = NULL, *bad = NULL;
+    unsigned char *blob = NULL, *sig = NULL;
+    unsigned char *name, *cname, *point, *r, *s;
+    char *data = NULL;
+    size_t blob_len = 0, sig_len = 0, name_len, cname_len, point_len;
+    size_t r_len, s_len, data_len = 0, hash_len, i;
+    struct string_buf buf;
+    ssh2_curve_type curve;
+    int rc = 1;
+
+    for(i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        ssh2_hash_alg alg;
+
+        /* the mbedTLS backend cannot derive ECDSA public keys yet, so
+           take the wire blob from the .pub file */
+        if(read_pub_blob(session, keys[i].name, &blob, &blob_len))
+            goto fail;
+
+        /* private key loading, file and memory */
+        if(ssh2_ecdsa_new_priv(&priv, session, keypath(keys[i].name),
+                               NULL, 0, keys[i].passphrase))
+            FAIL(keys[i].name);
+        EXPECT(ssh2_ecdsa_get_curve_type(priv) == keys[i].curve);
+        ssh2_ecdsa_free(priv, session);
+        priv = NULL;
+
+        EXPECT(ssh2_file_to_blob(session, keypath(keys[i].name),
+                                 &data, &data_len) == 0);
+        if(ssh2_ecdsa_new_priv(&priv, session, NULL, data, data_len,
+                               keys[i].passphrase))
+            FAIL(keys[i].name);
+        EXPECT(ssh2_ecdsa_get_curve_type(priv) == keys[i].curve);
+        ssh2_zero_free(session, data, data_len);
+        data = NULL;
+
+        /* public key from the wire blob: method || curve || point */
+        buf.data = buf.dataptr = blob;
+        buf.len = blob_len;
+        EXPECT(ssh2_get_string(&buf, &name, &name_len) == 0);
+        EXPECT(ssh2_get_string(&buf, &cname, &cname_len) == 0);
+        EXPECT(ssh2_get_string(&buf, &point, &point_len) == 0);
+        EXPECT(ssh2_pem_ecdsa_curve_type_from_name(
+                   (const char *)name, name_len, &curve) == 0);
+        EXPECT(curve == keys[i].curve);
+        EXPECT(ssh2_ecdsa_curve_name_with_octal_new(
+                   &pub, session, point, point_len, curve) == 0);
+        EXPECT(ssh2_ecdsa_get_curve_type(pub) == keys[i].curve);
+
+        /* a truncated point must be refused */
+        EXPECT(ssh2_ecdsa_curve_name_with_octal_new(
+                   &bad, session, point, point_len - 1, curve) != 0);
+        EXPECT(!bad);
+
+        /* sign and verify with the curve's hash */
+        alg = curve_hash(keys[i].bits, &hash_len);
+        EXPECT(ssh2_hash(alg, msg, sizeof(msg), hash, hash_len));
+        EXPECT(ssh2_ecdsa_sign(priv, session, hash, hash_len,
+                               &sig, &sig_len) == 0);
+
+        buf.data = buf.dataptr = sig;
+        buf.len = sig_len;
+        EXPECT(ssh2_get_bignum_bytes(&buf, &r, &r_len) == 0);
+        EXPECT(ssh2_get_bignum_bytes(&buf, &s, &s_len) == 0);
+        EXPECT(buf.dataptr == buf.data + buf.len);
+
+        EXPECT(ssh2_ecdsa_verify(pub, session, r, r_len, s, s_len,
+                                 msg, sizeof(msg)) == 0);
+        EXPECT(ssh2_ecdsa_verify(priv, session, r, r_len, s, s_len,
+                                 msg, sizeof(msg)) == 0);
+
+        memcpy(tampered, msg, sizeof(msg));
+        tampered[3] ^= 1;
+        EXPECT(ssh2_ecdsa_verify(pub, session, r, r_len, s, s_len,
+                                 tampered, sizeof(tampered)) != 0);
+        EXPECT(ssh2_ecdsa_verify(pub, session, s, s_len, r, r_len,
+                                 msg, sizeof(msg)) != 0);
+
+        SSH2_SAFEFREE(session, sig);
+        SSH2_SAFEFREE(session, blob);
+        ssh2_ecdsa_free(priv, session);
+        ssh2_ecdsa_free(pub, session);
+        priv = pub = NULL;
+    }
+
+    /* wrong passphrase must fail */
+    EXPECT(ssh2_ecdsa_new_priv(&priv, session,
+                               keypath("id_ecdsa_pem_encrypted"),
+                               NULL, 0, "wrong") != 0);
+    EXPECT(!priv);
+    EXPECT(ssh2_ecdsa_new_priv(&priv, session,
+                               keypath("id_ecdsa_openssh_encrypted"),
+                               NULL, 0, "wrong") != 0);
+    EXPECT(!priv);
+
+    /* ECDH on every curve */
+    for(i = 0; i < sizeof(curves) / sizeof(curves[0]); i++)
+        if(check_ecdh(session, curves[i], curve_bits[i]))
+            goto fail;
+
+    rc = 0;
+
+fail:
+    SSH2_FREE(session, sig);
+    ssh2_ecdsa_free(priv, session);
+    ssh2_ecdsa_free(pub, session);
+    ssh2_zero_free(session, data, data_len);
+    SSH2_FREE(session, blob);
+    return rc;
+}
+#endif /* LIBSSH2_ECDSA */
+
 int main(int argc, char *argv[])
 {
     LIBSSH2_SESSION *session;
@@ -255,6 +463,9 @@ int main(int argc, char *argv[])
     rc = 0;
 #if LIBSSH2_RSA
     rc |= test_rsa(session);
+#endif
+#if LIBSSH2_ECDSA
+    rc |= test_ecdsa(session);
 #endif
 
     libssh2_session_free(session);
