@@ -33,6 +33,7 @@ test_auth_pubkey_ok_rsa_pem
 test_auth_pubkey_ok_rsa_pem_encrypted
 test_auth_pubkey_ok_rsa_pkcs8
 test_auth_pubkey_ok_rsa_pkcs8_encrypted
+test_crypto
 test_hostkey
 test_hostkey_hash
 test_read
