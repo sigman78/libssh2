@@ -37,10 +37,11 @@
 
 #include <mbedtls/version.h>
 
-#if MBEDTLS_VERSION_NUMBER < 0x03010000
-#  error "mbedTLS 3.1.0 or greater required"
+#if MBEDTLS_VERSION_NUMBER < 0x03060000
+#  error "mbedTLS 3.6.0 or greater required"
 #endif
 #include <mbedtls/platform.h>
+#include <mbedtls/platform_util.h>
 #include <psa/crypto_config.h>
 #include <psa/crypto.h>
 #if !(defined(PSA_WANT_ALG_ECDSA) && PSA_WANT_ALG_ECDSA && \
