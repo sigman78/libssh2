@@ -56,9 +56,9 @@ else()
 
   find_path(MBEDTLS_INCLUDE_DIR NAMES "mbedtls/version.h")
   if(MBEDTLS_USE_STATIC_LIBS)
-    find_library(MBEDCRYPTO_LIBRARY NAMES "mbedcrypto_static" "libmbedcrypto_static" "mbedcrypto" "libmbedcrypto")
+    find_library(MBEDCRYPTO_LIBRARY NAMES "tfpsacrypto_static" "libtfpsacrypto_static" "tfpsacrypto" "libtfpsacrypto" "mbedcrypto_static" "libmbedcrypto_static" "mbedcrypto" "libmbedcrypto")
   else()
-    find_library(MBEDCRYPTO_LIBRARY NAMES "mbedcrypto" "libmbedcrypto")
+    find_library(MBEDCRYPTO_LIBRARY NAMES "tfpsacrypto" "libtfpsacrypto" "mbedcrypto" "libmbedcrypto")
   endif()
 
   unset(MBEDTLS_VERSION CACHE)

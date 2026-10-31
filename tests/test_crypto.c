@@ -9,6 +9,7 @@
 #ifdef LIBSSH2_MBEDTLS
 /* mbedtls_psa_get_stats() fields are private */
 #define MBEDTLS_ALLOW_PRIVATE_ACCESS
+#define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
 #endif
 
 #include "libssh2_priv.h"

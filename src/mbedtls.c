@@ -44,6 +44,12 @@
     mbedtls_pk_parse_key(pk, key, keylen, pwd, pwdlen, MBED_RNG)
 #define mbed_pk_parse_keyfile(pk, path, pwd) \
     mbedtls_pk_parse_keyfile(pk, path, pwd, MBED_RNG)
+#else
+/* 4.x parsers take randomness from PSA themselves */
+#define mbed_pk_parse_key(pk, key, keylen, pwd, pwdlen) \
+    mbedtls_pk_parse_key(pk, key, keylen, pwd, pwdlen)
+#define mbed_pk_parse_keyfile(pk, path, pwd) \
+    mbedtls_pk_parse_keyfile(pk, path, pwd)
 #endif
 
 /*******************************************************************/
@@ -518,7 +524,7 @@ static int mbed_pk_parse(mbedtls_pk_context *pk, LIBSSH2_SESSION *session,
     /* the pk parser wants PEM input null-terminated */
     data = SSH2_ALLOC(session, blob_len + 1);
     if(!data)
-        return MBEDTLS_ERR_PK_ALLOC_FAILED;
+        return PSA_ERROR_INSUFFICIENT_MEMORY;
     memcpy(data, blob, blob_len);
     data[blob_len] = '\0';
     ret = mbed_pk_parse_key(pk, data, blob_len + 1,
@@ -526,6 +532,21 @@ static int mbed_pk_parse(mbedtls_pk_context *pk, LIBSSH2_SESSION *session,
                             passphrase ? strlen(passphrase) : 0);
     ssh2_zero_free(session, data, blob_len + 1);
     return ret;
+}
+
+/* RSA modulus bits of a parsed key, 0 for other types. 4.x has no
+   mbedtls_pk_get_type(), so the type is read from the PSA attributes. */
+static size_t mbed_pk_rsa_bits(const mbedtls_pk_context *pk)
+{
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+    size_t bits = 0;
+
+    if(mbedtls_pk_get_psa_attributes(pk, PSA_KEY_USAGE_SIGN_HASH,
+                                     &attr) == 0 &&
+       PSA_KEY_TYPE_IS_RSA(psa_get_key_type(&attr)))
+        bits = mbedtls_pk_get_bitlen(pk);
+    psa_reset_key_attributes(&attr);
+    return bits;
 }
 
 /* Moves a parsed private key into PSA. `type` must match the parsed key,
@@ -772,6 +793,7 @@ int ssh2_rsa_new_priv(ssh2_rsa_ctx **rsa,
                       const char *passphrase)
 {
     mbedtls_pk_context pk;
+    size_t pk_bits;
     int ret = -1;
 
     *rsa = mbed_key_alloc(session);
@@ -784,9 +806,12 @@ int ssh2_rsa_new_priv(ssh2_rsa_ctx **rsa,
         if(mbed_pk_import(&pk, PSA_KEY_TYPE_RSA_KEY_PAIR, MBED_RSA_ALG,
                           *rsa) == 0)
             ret = 0;
-        else if(mbedtls_pk_get_type(&pk) == MBEDTLS_PK_RSA)
-            ret = mbed_rsa_size_err(session, LIBSSH2_ERROR_FILE,
-                                    mbedtls_pk_get_bitlen(&pk));
+        else {
+            pk_bits = mbed_pk_rsa_bits(&pk);
+            if(pk_bits)
+                ret = mbed_rsa_size_err(session, LIBSSH2_ERROR_FILE,
+                                        pk_bits);
+        }
     }
     mbedtls_pk_free(&pk);
 
@@ -1175,12 +1200,11 @@ static int mbed_pub_priv_key(LIBSSH2_SESSION *session, char **method,
     size_t bits;
     int ret;
 
-    /* a throwaway import of the public half: that is all that is read
-       back, and a verify-only request makes PSA derive the public key */
-    if(mbedtls_pk_get_psa_attributes(pk, PSA_KEY_USAGE_VERIFY_HASH, &attr) ||
+    /* a public-only import reads pk->pub_raw, which the 4.x RSA parser does
+       not fill, so the pair is imported and the public half exported */
+    if(mbedtls_pk_get_psa_attributes(pk, PSA_KEY_USAGE_SIGN_HASH, &attr) ||
        mbedtls_pk_import_into_psa(pk, &attr, &key)) {
-        size_t pk_bits = mbedtls_pk_get_type(pk) == MBEDTLS_PK_RSA ?
-                         mbedtls_pk_get_bitlen(pk) : 0;
+        size_t pk_bits = mbed_pk_rsa_bits(pk);
         psa_reset_key_attributes(&attr);
 #if LIBSSH2_RSA
         if(pk_bits) {
@@ -1196,14 +1220,14 @@ static int mbed_pub_priv_key(LIBSSH2_SESSION *session, char **method,
     psa_reset_key_attributes(&attr);
 
 #if LIBSSH2_RSA
-    if(type == PSA_KEY_TYPE_RSA_PUBLIC_KEY) {
+    if(type == PSA_KEY_TYPE_RSA_KEY_PAIR) {
         method_name = "ssh-rsa";
         ret = mbed_rsa_pubkey(session, key, pubkeydata, pubkeydata_len);
     }
     else
 #endif
 #if LIBSSH2_ECDSA
-    if(PSA_KEY_TYPE_IS_ECC(type) &&
+    if(PSA_KEY_TYPE_IS_ECC_KEY_PAIR(type) &&
        PSA_KEY_TYPE_ECC_GET_FAMILY(type) == PSA_ECC_FAMILY_SECP_R1 &&
        mbed_ecdsa_names(bits, &method_name, &curve_name) == 0) {
         ret = mbed_ecdsa_pubkey(session, key, method_name, curve_name,

@@ -35,6 +35,11 @@
 #define SSH2_CRYPTO_ENGINE libssh2_mbedtls
 #define SSH2_CRYPTO_ENGINE_NAME "mbedTLS"
 
+/* 4.x hides mpi behind this, 3.x ignores it */
+#ifndef MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
+#define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
+#endif
+
 #include <mbedtls/version.h>
 
 #if MBEDTLS_VERSION_NUMBER < 0x03060000
@@ -53,6 +58,9 @@
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
 #include <mbedtls/bignum.h>
 #include <mbedtls/psa_util.h>  /* mbedtls_psa_get_random() */
+#else
+/* mpi is kept for DH and bignum marshaling, PSA has no general bignum */
+#include <mbedtls/private/bignum.h>
 #endif
 #include <mbedtls/pk.h>
 #include <mbedtls/asn1.h>
