@@ -436,6 +436,396 @@ fail:
 }
 #endif /* LIBSSH2_ECDSA */
 
+/* Known-answer vectors: SHA-256 and HMAC-SHA-256 (RFC 4231 case 2) */
+static int test_hash_hmac(void)
+{
+    static const unsigned char sha_abc[32] = {
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+    };
+    static const unsigned char hmac_exp[32] = {
+        0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e,
+        0x6a, 0x04, 0x24, 0x26, 0x08, 0x95, 0x75, 0xc7,
+        0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83,
+        0x9d, 0xec, 0x58, 0xb9, 0x64, 0xec, 0x38, 0x43
+    };
+    unsigned char key[4] = { 'J', 'e', 'f', 'e' };
+    const char *data = "what do ya want for nothing?";
+    unsigned char out[32];
+    ssh2_hash_ctx hctx;
+    ssh2_hmac_ctx mctx;
+    int rc = 1;
+
+    EXPECT(ssh2_hash(SSH2_SHA256_ALG, "abc", 3, out, sizeof(out)));
+    EXPECT(memcmp(out, sha_abc, sizeof(out)) == 0);
+
+    memset(out, 0, sizeof(out));
+    EXPECT(ssh2_hash_init(&hctx, SSH2_SHA256_ALG));
+    EXPECT(ssh2_hash_update(&hctx, "a", 1));
+    EXPECT(ssh2_hash_update(&hctx, "bc", 2));
+    EXPECT(ssh2_hash_final(&hctx, out, sizeof(out)));
+    EXPECT(memcmp(out, sha_abc, sizeof(out)) == 0);
+
+    memset(out, 0, sizeof(out));
+    EXPECT(ssh2_hmac_ctx_init(&mctx));
+    EXPECT(ssh2_hmac_init(&mctx, SSH2_SHA256_HMAC, key, sizeof(key)));
+    EXPECT(ssh2_hmac_update(&mctx, data, strlen(data)));
+    EXPECT(ssh2_hmac_final(&mctx, out, sizeof(out)));
+    ssh2_hmac_cleanup(&mctx);
+    EXPECT(memcmp(out, hmac_exp, sizeof(out)) == 0);
+
+    rc = 0;
+
+fail:
+    return rc;
+}
+
+#if LIBSSH2_AES_CTR || LIBSSH2_AES_CBC
+static const unsigned char nist_key[16] = {
+    0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+    0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c
+};
+
+static const unsigned char nist_pt[2][16] = {
+    { 0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+      0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a },
+    { 0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c,
+      0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51 }
+};
+
+/* Two chunks through one context: state must carry across calls */
+static int cipher_kat(SSH2_CIPHER_T(algo), unsigned char *iv,
+                      const unsigned char ct[2][16])
+{
+    ssh2_cipher_ctx c;
+    unsigned char buf[2][16];
+    int i, rc = 1;
+
+    memcpy(buf, nist_pt, sizeof(buf));
+    if(ssh2_cipher_init(&c, algo, iv, (unsigned char *)nist_key, 1))
+        FAIL("cipher init");
+    for(i = 0; i < 2; i++) {
+        if(ssh2_cipher_crypt(&c, algo, 1, buf[i], 16, MIDDLE_BLOCK)) {
+            ssh2_cipher_dtor(&c);
+            FAIL("cipher crypt");
+        }
+    }
+    ssh2_cipher_dtor(&c);
+    EXPECT(memcmp(buf, ct, sizeof(buf)) == 0);
+
+    /* and back */
+    if(ssh2_cipher_init(&c, algo, iv, (unsigned char *)nist_key, 0))
+        FAIL("cipher init");
+    for(i = 0; i < 2; i++) {
+        if(ssh2_cipher_crypt(&c, algo, 0, buf[i], 16, MIDDLE_BLOCK)) {
+            ssh2_cipher_dtor(&c);
+            FAIL("cipher crypt");
+        }
+    }
+    ssh2_cipher_dtor(&c);
+    EXPECT(memcmp(buf, nist_pt, sizeof(buf)) == 0);
+
+    rc = 0;
+
+fail:
+    return rc;
+}
+#endif
+
+#if LIBSSH2_AES_CTR
+/* NIST SP 800-38A F.5.1, CTR-AES128 */
+static int test_aes_ctr_kat(void)
+{
+    static const unsigned char ctr[16] = {
+        0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+        0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff
+    };
+    static const unsigned char ct[2][16] = {
+        { 0x87, 0x4d, 0x61, 0x91, 0xb6, 0x20, 0xe3, 0x26,
+          0x1b, 0xef, 0x68, 0x64, 0x99, 0x0d, 0xb6, 0xce },
+        { 0x98, 0x06, 0xf6, 0x6b, 0x79, 0x70, 0xfd, 0xff,
+          0x86, 0x17, 0x18, 0x7b, 0xb9, 0xff, 0xfd, 0xff }
+    };
+    unsigned char iv[16];
+
+    memcpy(iv, ctr, sizeof(iv));
+    return cipher_kat(ssh2_cipher_aes128ctr, iv, ct);
+}
+#endif
+
+#if LIBSSH2_AES_CBC
+/* NIST SP 800-38A F.2.1, CBC-AES128 */
+static int test_aes_cbc_kat(void)
+{
+    static const unsigned char ct[2][16] = {
+        { 0x76, 0x49, 0xab, 0xac, 0x81, 0x19, 0xb2, 0x46,
+          0xce, 0xe9, 0x8e, 0x9b, 0x12, 0xe9, 0x19, 0x7d },
+        { 0x50, 0x86, 0xcb, 0x9b, 0x50, 0x72, 0x19, 0xee,
+          0x95, 0xdb, 0x11, 0x3a, 0x91, 0x76, 0x78, 0xb2 }
+    };
+    unsigned char iv[16];
+    int i;
+
+    for(i = 0; i < 16; i++)
+        iv[i] = (unsigned char)i;
+    return cipher_kat(ssh2_cipher_aes128, iv, ct);
+}
+#endif
+
+#if LIBSSH2_AES_CTR || LIBSSH2_AES_CBC || LIBSSH2_3DES
+/* Random key and IV, four chunks of different multiples of the block
+   size, in place; a second context decrypts chunk by chunk. */
+static int cipher_roundtrip(const char *name, SSH2_CIPHER_T(algo),
+                            size_t keylen, size_t ivlen, size_t bs)
+{
+    unsigned char key[32], iv[16], plain[512], buf[512];
+    const size_t mult[4] = { 1, 3, 2, 5 };
+    ssh2_cipher_ctx enc, dec;
+    size_t i, off, total = 0;
+    int have_enc = 0, have_dec = 0, rc = 1;
+
+    for(i = 0; i < 4; i++)
+        total += mult[i] * bs;
+
+    EXPECT(ssh2_random(key, keylen) == 0);
+    EXPECT(ssh2_random(iv, ivlen) == 0);
+    EXPECT(ssh2_random(plain, total) == 0);
+    memcpy(buf, plain, total);
+
+    if(ssh2_cipher_init(&enc, algo, iv, key, 1))
+        FAIL(name);
+    have_enc = 1;
+    if(ssh2_cipher_init(&dec, algo, iv, key, 0))
+        FAIL(name);
+    have_dec = 1;
+
+    for(i = 0, off = 0; i < 4; i++) {
+        if(ssh2_cipher_crypt(&enc, algo, 1, buf + off, mult[i] * bs,
+                             MIDDLE_BLOCK))
+            FAIL(name);
+        off += mult[i] * bs;
+    }
+    EXPECT(memcmp(buf, plain, total) != 0);
+
+    /* a flipped ciphertext byte must not decrypt to the original */
+    buf[total / 2] ^= 0x01;
+    for(i = 0, off = 0; i < 4; i++) {
+        if(ssh2_cipher_crypt(&dec, algo, 0, buf + off, mult[i] * bs,
+                             MIDDLE_BLOCK))
+            FAIL(name);
+        off += mult[i] * bs;
+    }
+    EXPECT(memcmp(buf, plain, total) != 0);
+
+    /* now the undamaged path */
+    ssh2_cipher_dtor(&dec);
+    have_dec = 0;
+    ssh2_cipher_dtor(&enc);
+    have_enc = 0;
+    memcpy(buf, plain, total);
+    if(ssh2_cipher_init(&enc, algo, iv, key, 1))
+        FAIL(name);
+    have_enc = 1;
+    if(ssh2_cipher_init(&dec, algo, iv, key, 0))
+        FAIL(name);
+    have_dec = 1;
+    for(i = 0, off = 0; i < 4; i++) {
+        if(ssh2_cipher_crypt(&enc, algo, 1, buf + off, mult[i] * bs,
+                             MIDDLE_BLOCK))
+            FAIL(name);
+        off += mult[i] * bs;
+    }
+    for(i = 0, off = 0; i < 4; i++) {
+        if(ssh2_cipher_crypt(&dec, algo, 0, buf + off, mult[i] * bs,
+                             MIDDLE_BLOCK))
+            FAIL(name);
+        off += mult[i] * bs;
+    }
+    EXPECT(memcmp(buf, plain, total) == 0);
+    rc = 0;
+
+fail:
+    if(have_enc)
+        ssh2_cipher_dtor(&enc);
+    if(have_dec)
+        ssh2_cipher_dtor(&dec);
+    return rc;
+}
+
+static int test_cipher_roundtrips(void)
+{
+    int rc = 0;
+#if LIBSSH2_AES_CTR
+    rc |= cipher_roundtrip("aes128-ctr", ssh2_cipher_aes128ctr, 16, 16, 16);
+    rc |= cipher_roundtrip("aes192-ctr", ssh2_cipher_aes192ctr, 24, 16, 16);
+    rc |= cipher_roundtrip("aes256-ctr", ssh2_cipher_aes256ctr, 32, 16, 16);
+#endif
+#if LIBSSH2_AES_CBC
+    rc |= cipher_roundtrip("aes128-cbc", ssh2_cipher_aes128, 16, 16, 16);
+    rc |= cipher_roundtrip("aes192-cbc", ssh2_cipher_aes192, 24, 16, 16);
+    rc |= cipher_roundtrip("aes256-cbc", ssh2_cipher_aes256, 32, 16, 16);
+#endif
+#if LIBSSH2_3DES
+    rc |= cipher_roundtrip("3des-cbc", ssh2_cipher_3des, 24, 8, 8);
+#endif
+    return rc;
+}
+#endif
+
+#if LIBSSH2_AES_GCM
+/* AES-GCM as driven by src/transport.c (blocksize 16, 16-byte tag, flags
+   INTEGRATED_MAC | PKTLEN_AAD), for a packet of L = 4 + 16*k bytes
+   (4-byte length, then k blocks) followed by a 16-byte tag slot:
+   send: crypt() on every 16-byte slice of [0, L) at offset i, the last
+         one only 4 bytes; FIRST_BLOCK for i == 0, else MIDDLE_BLOCK;
+         then one crypt() of the 16 tag bytes at offset L, LAST_BLOCK.
+         Bytes 0-3 are AAD (left in the clear), the tag is written.
+   recv: crypt() of the first 16 bytes with FIRST_BLOCK; then 16-byte
+         MIDDLE_BLOCK slices until fewer than 32 bytes remain; the rest
+         (payload tail plus the tag, 16..31 bytes) in one LAST_BLOCK call.
+         Tag mismatch makes that LAST_BLOCK call fail.
+   The IV is incremented after each packet, so a context pair is run
+   through two packets. */
+#define GCM_BS  16
+#define GCM_TAG 16
+
+static int gcm_send(ssh2_cipher_ctx *c, SSH2_CIPHER_T(algo),
+                    unsigned char *pkt, size_t L)
+{
+    size_t i;
+
+    for(i = 0; i < L; i += GCM_BS) {
+        size_t n = L - i < GCM_BS ? L - i : GCM_BS;
+        if(ssh2_cipher_crypt(c, algo, 1, pkt + i, n,
+                             i == 0 ? FIRST_BLOCK : MIDDLE_BLOCK))
+            return -1;
+    }
+    return ssh2_cipher_crypt(c, algo, 1, pkt + L, GCM_TAG, LAST_BLOCK);
+}
+
+static int gcm_recv(ssh2_cipher_ctx *c, SSH2_CIPHER_T(algo),
+                    unsigned char *pkt, size_t L)
+{
+    size_t len = L + GCM_TAG, off = 0;
+    int first = 1;
+
+    while(len > 0) {
+        size_t n = len < GCM_BS ? len : GCM_BS;
+        int fl;
+
+        if(first)
+            fl = FIRST_BLOCK;
+        else if(len < 2 * GCM_BS) {
+            n = len;
+            fl = LAST_BLOCK;
+        }
+        else
+            fl = MIDDLE_BLOCK;
+
+        if(ssh2_cipher_crypt(c, algo, 0, pkt + off, n, fl))
+            return -1;
+        first = 0;
+        off += n;
+        len -= n;
+    }
+    return 0;
+}
+
+static int gcm_case(const char *name, SSH2_CIPHER_T(algo), size_t keylen)
+{
+    static const size_t blocks[2] = { 2, 5 };
+    unsigned char key[32], iv[12];
+    unsigned char plain[2][4 + 16 * 5 + GCM_TAG];
+    unsigned char wire[2][4 + 16 * 5 + GCM_TAG];
+    unsigned char bad[4 + 16 * 5 + GCM_TAG];
+    ssh2_cipher_ctx enc, dec;
+    size_t L[2], i;
+    int have_enc = 0, have_dec = 0, rc = 1;
+
+    EXPECT(ssh2_random(key, keylen) == 0);
+    EXPECT(ssh2_random(iv, sizeof(iv)) == 0);
+
+    for(i = 0; i < 2; i++) {
+        L[i] = 4 + 16 * blocks[i];
+        EXPECT(ssh2_random(plain[i], L[i]) == 0);
+        memcpy(wire[i], plain[i], L[i]);
+    }
+
+    if(ssh2_cipher_init(&enc, algo, iv, key, 1))
+        FAIL(name);
+    have_enc = 1;
+    if(ssh2_cipher_init(&dec, algo, iv, key, 0))
+        FAIL(name);
+    have_dec = 1;
+
+    for(i = 0; i < 2; i++) {
+        if(gcm_send(&enc, algo, wire[i], L[i]))
+            FAIL(name);
+        /* AAD stays in the clear, payload does not */
+        EXPECT(memcmp(wire[i], plain[i], 4) == 0);
+        EXPECT(memcmp(wire[i] + 4, plain[i] + 4, L[i] - 4) != 0);
+    }
+
+    /* the second packet is only right if the IV was bumped in between */
+    for(i = 0; i < 2; i++) {
+        memcpy(bad, wire[i], L[i] + GCM_TAG);
+        if(gcm_recv(&dec, algo, bad, L[i]))
+            FAIL(name);
+        EXPECT(memcmp(bad, plain[i], L[i]) == 0);
+    }
+
+    ssh2_cipher_dtor(&dec);
+    have_dec = 0;
+
+    /* flipped tag byte */
+    if(ssh2_cipher_init(&dec, algo, iv, key, 0))
+        FAIL(name);
+    have_dec = 1;
+    memcpy(bad, wire[0], L[0] + GCM_TAG);
+    bad[L[0] + 3] ^= 0x01;
+    EXPECT(gcm_recv(&dec, algo, bad, L[0]) != 0);
+    ssh2_cipher_dtor(&dec);
+    have_dec = 0;
+
+    /* flipped AAD byte */
+    if(ssh2_cipher_init(&dec, algo, iv, key, 0))
+        FAIL(name);
+    have_dec = 1;
+    memcpy(bad, wire[0], L[0] + GCM_TAG);
+    bad[3] ^= 0x01;
+    EXPECT(gcm_recv(&dec, algo, bad, L[0]) != 0);
+    ssh2_cipher_dtor(&dec);
+    have_dec = 0;
+
+    /* flipped payload byte */
+    if(ssh2_cipher_init(&dec, algo, iv, key, 0))
+        FAIL(name);
+    have_dec = 1;
+    memcpy(bad, wire[0], L[0] + GCM_TAG);
+    bad[20] ^= 0x01;
+    EXPECT(gcm_recv(&dec, algo, bad, L[0]) != 0);
+
+    rc = 0;
+
+fail:
+    if(have_enc)
+        ssh2_cipher_dtor(&enc);
+    if(have_dec)
+        ssh2_cipher_dtor(&dec);
+    return rc;
+}
+
+static int test_aes_gcm(void)
+{
+    int rc = 0;
+    rc |= gcm_case("aes128-gcm", ssh2_cipher_aes128gcm, 16);
+    rc |= gcm_case("aes256-gcm", ssh2_cipher_aes256gcm, 32);
+    return rc;
+}
+#endif
+
 int main(int argc, char *argv[])
 {
     LIBSSH2_SESSION *session;
@@ -466,6 +856,19 @@ int main(int argc, char *argv[])
 #endif
 #if LIBSSH2_ECDSA
     rc |= test_ecdsa(session);
+#endif
+    rc |= test_hash_hmac();
+#if LIBSSH2_AES_CTR
+    rc |= test_aes_ctr_kat();
+#endif
+#if LIBSSH2_AES_CBC
+    rc |= test_aes_cbc_kat();
+#endif
+#if LIBSSH2_AES_CTR || LIBSSH2_AES_CBC || LIBSSH2_3DES
+    rc |= test_cipher_roundtrips();
+#endif
+#if LIBSSH2_AES_GCM
+    rc |= test_aes_gcm();
 #endif
 
     libssh2_session_free(session);
