@@ -40,9 +40,6 @@
 #if MBEDTLS_VERSION_NUMBER < 0x03010000
 #  error "mbedTLS 3.1.0 or greater required"
 #endif
-#if MBEDTLS_VERSION_NUMBER < 0x04000000 && !defined(MBEDTLS_CTR_DRBG_C)
-#  error "MBEDTLS_CTR_DRBG_C is required for mbedTLS 3.x."
-#endif
 #if !defined(MBEDTLS_ECDH_C) || \
     !defined(MBEDTLS_ECDSA_C) || \
     !defined(MBEDTLS_ECP_DP_SECP256R1_ENABLED) || \
@@ -67,8 +64,7 @@
 #ifdef MBEDTLS_ECDSA_C
 # include <mbedtls/ecdsa.h>
 #endif
-#include <mbedtls/entropy.h>
-#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/psa_util.h>  /* mbedtls_psa_get_random() */
 #endif
 #include <mbedtls/pk.h>
 #include <mbedtls/error.h>
