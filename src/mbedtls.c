@@ -1247,6 +1247,25 @@ static int mbed_pub_priv_key(LIBSSH2_SESSION *session, char **method,
     return ret;
 }
 
+/* Maps a pk parser error to a session error. mbedtls_strerror() lives in
+   the TLS library on 4.x, which crypto-only links do not have. */
+static int mbed_pk_err(LIBSSH2_SESSION *session, int pkret)
+{
+    char buf[64];
+
+    if(pkret == MBEDTLS_ERR_PK_PASSWORD_REQUIRED)
+        return ssh2_err(session, LIBSSH2_ERROR_KEYFILE_AUTH_FAILED,
+                        "Passphrase required for private key");
+    if(pkret == MBEDTLS_ERR_PK_PASSWORD_MISMATCH)
+        return ssh2_err(session, LIBSSH2_ERROR_KEYFILE_AUTH_FAILED,
+                        "Wrong passphrase for private key");
+
+    ssh2_snprintf(buf, sizeof(buf), "Unable to parse private key (-0x%04x)",
+                  (unsigned int)-pkret);
+    return ssh2_err_flags(session, LIBSSH2_ERROR_FILE, buf,
+                          SSH2_ERR_FLAG_DUP);
+}
+
 int ssh2_pub_privkey(LIBSSH2_SESSION *session, char **method,
                      unsigned char **pubkeydata, size_t *pubkeydata_len,
                      const char *privkeyfile,
@@ -1254,7 +1273,6 @@ int ssh2_pub_privkey(LIBSSH2_SESSION *session, char **method,
                      const char *passphrase)
 {
     mbedtls_pk_context pk;
-    char buf[1024];
     int ret;
 
     mbedtls_pk_init(&pk);
@@ -1269,10 +1287,8 @@ int ssh2_pub_privkey(LIBSSH2_SESSION *session, char **method,
             return 0;
         }
 #endif
-        mbedtls_strerror(ret, buf, sizeof(buf));
         mbedtls_pk_free(&pk);
-        return ssh2_err_flags(session, LIBSSH2_ERROR_FILE, buf,
-                              SSH2_ERR_FLAG_DUP);
+        return mbed_pk_err(session, ret);
     }
 
     ret = mbed_pub_priv_key(session, method,
