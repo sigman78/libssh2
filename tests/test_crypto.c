@@ -867,7 +867,10 @@ static int test_ecdsa(LIBSSH2_SESSION *session)
     EXPECT(!priv);
     EXPECT(ssh2_ecdsa_new_priv(&priv, session,
                                keypath("id_ecdsa_openssh_encrypted"),
-                               NULL, 0, "wrong") != 0);
+                               NULL, 0, "wrong") ==
+           LIBSSH2_ERROR_KEYFILE_AUTH_FAILED);
+    EXPECT(libssh2_session_last_errno(session) ==
+           LIBSSH2_ERROR_KEYFILE_AUTH_FAILED);
     EXPECT(!priv);
 
     /* ECDH on every curve */
@@ -1216,7 +1219,8 @@ static int check_openssh_envelope(LIBSSH2_SESSION *session)
 {
     unsigned char *pubblob = NULL, *der = NULL, *p, *end;
     unsigned char *pub, *alg;
-    char *file = NULL, *pem = NULL, *method = NULL;
+    static const char junk[] = "\xef\xbb\xbf# made by hand\n";
+    char *file = NULL, *pem = NULL, *method = NULL, *pre = NULL;
     unsigned char *pubkey = NULL;
     size_t pubblob_len = 0, der_len = 0, file_len = 0, pem_len = 0;
     size_t alg_len, pub_len, pubkey_len = 0;
@@ -1235,6 +1239,24 @@ static int check_openssh_envelope(LIBSSH2_SESSION *session)
     EXPECT(ssh2_file_to_blob(session, keypath("id_ed25519_openssh"),
                              &file, &file_len) == 0);
     EXPECT(unwrap_pem(session, file, file_len, &der, &der_len) == 0);
+
+    /* a byte order mark and a comment before the header are skipped by
+       every entry point alike */
+    pre = SSH2_ALLOC(session, file_len + sizeof(junk));
+    EXPECT(pre);
+    memcpy(pre, junk, sizeof(junk) - 1);
+    memcpy(pre + sizeof(junk) - 1, file, file_len);
+    EXPECT(ssh2_ed25519_new_priv(&key, session, NULL, pre,
+                                 file_len + sizeof(junk) - 1, NULL) == 0);
+    ssh2_ed25519_free(key, session);
+    key = NULL;
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len, NULL,
+                            pre, file_len + sizeof(junk) - 1, NULL) == 0);
+    EXPECT(pubkey_len == pubblob_len);
+    EXPECT(memcmp(pubkey, pubblob, pubblob_len) == 0);
+    SSH2_SAFEFREE(session, method);
+    SSH2_SAFEFREE(session, pubkey);
+    pubkey_len = 0;
 
     /* the untouched key survives the round trip through our encoder */
     EXPECT(make_pem(session, "OPENSSH PRIVATE KEY", der, der_len,
@@ -1268,6 +1290,9 @@ static int check_openssh_envelope(LIBSSH2_SESSION *session)
 
 fail:
     SSH2_FREE(session, pubblob);
+    SSH2_FREE(session, pre);
+    SSH2_FREE(session, method);
+    SSH2_FREE(session, pubkey);
     ssh2_zero_free(session, der, der_len);
     ssh2_zero_free(session, file, file_len + 1);
     ssh2_zero_free(session, pem, pem_len);
@@ -1304,6 +1329,8 @@ static int check_pub_privkey_errors(LIBSSH2_SESSION *session)
                             keypath("id_ed25519_openssh_encrypted"),
                             NULL, 0, "wrong") ==
            LIBSSH2_ERROR_KEYFILE_AUTH_FAILED);
+    EXPECT(libssh2_session_last_errno(session) ==
+           LIBSSH2_ERROR_KEYFILE_AUTH_FAILED);
     EXPECT(!method && !pubkey && pubkey_len == 0);
     rc = 0;
 
@@ -1313,6 +1340,24 @@ fail:
     return rc;
 }
 #endif
+
+static int check_curve25519_null_outputs(LIBSSH2_SESSION *session)
+{
+    uint8_t *pub = NULL, *priv = NULL;
+    int rc = 1;
+
+    EXPECT(ssh2_curve25519_new(session, &pub, NULL) == 0);
+    EXPECT(pub);
+    SSH2_SAFEFREE(session, pub);
+    EXPECT(ssh2_curve25519_new(session, NULL, &priv) == 0);
+    EXPECT(priv);
+    rc = 0;
+
+fail:
+    SSH2_FREE(session, pub);
+    ssh2_zero_free(session, priv, SSH2_ED25519_KEY_LEN);
+    return rc;
+}
 
 static int test_ed25519(LIBSSH2_SESSION *session)
 {
@@ -1459,7 +1504,7 @@ static int test_ed25519(LIBSSH2_SESSION *session)
         goto fail;
 #endif
 
-    if(check_curve25519(session))
+    if(check_curve25519(session) || check_curve25519_null_outputs(session))
         goto fail;
     if(check_x25519_kat(
            "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
