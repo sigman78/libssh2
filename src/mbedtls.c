@@ -66,97 +66,221 @@ int ssh2_random(unsigned char *buf, size_t len)
     return psa_generate_random(buf, len) == PSA_SUCCESS ? 0 : -1;
 }
 
+/* Cipher algorithm -> PSA key type, key size, algorithm and mode */
+static int mbed_cipher_params(ssh2_mbed_cipher_type algo,
+                              psa_key_type_t *type, size_t *bits,
+                              psa_algorithm_t *alg, int *is_aead)
+{
+    *is_aead = 0;
+
+    switch(algo) {
+#if LIBSSH2_AES_CTR
+    case MBED_CIPHER_AES128_CTR:
+    case MBED_CIPHER_AES192_CTR:
+    case MBED_CIPHER_AES256_CTR:
+        *type = PSA_KEY_TYPE_AES;
+        *alg = PSA_ALG_CTR;
+        *bits = algo == MBED_CIPHER_AES128_CTR ? 128 :
+                algo == MBED_CIPHER_AES192_CTR ? 192 : 256;
+        return 0;
+#endif
+#if LIBSSH2_AES_CBC
+    case MBED_CIPHER_AES128_CBC:
+    case MBED_CIPHER_AES192_CBC:
+    case MBED_CIPHER_AES256_CBC:
+        /* libssh2 adds the SSH packet padding itself */
+        *type = PSA_KEY_TYPE_AES;
+        *alg = PSA_ALG_CBC_NO_PADDING;
+        *bits = algo == MBED_CIPHER_AES128_CBC ? 128 :
+                algo == MBED_CIPHER_AES192_CBC ? 192 : 256;
+        return 0;
+#endif
+#if LIBSSH2_3DES
+    case MBED_CIPHER_3DES_CBC:
+        *type = PSA_KEY_TYPE_DES;
+        *alg = PSA_ALG_CBC_NO_PADDING;
+        *bits = 192;
+        return 0;
+#endif
+#if LIBSSH2_AES_GCM
+    case MBED_CIPHER_AES128_GCM:
+    case MBED_CIPHER_AES256_GCM:
+        *type = PSA_KEY_TYPE_AES;
+        *alg = PSA_ALG_GCM;
+        *bits = algo == MBED_CIPHER_AES128_GCM ? 128 : 256;
+        *is_aead = 1;
+        return 0;
+#endif
+    default:
+        break;
+    }
+    return -1;
+}
+
 int ssh2_cipher_init(ssh2_cipher_ctx *ctx, SSH2_CIPHER_T(algo),
                      unsigned char *iv, unsigned char *secret, int encrypt)
 {
-    const mbedtls_cipher_info_t *cipher_info;
-    mbedtls_operation_t op;
-    int ret;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_type_t type;
+    psa_algorithm_t alg;
+    size_t bits;
+    int is_aead;
 
     if(!ctx)
         return -1;
 
     memset(ctx, 0, sizeof(*ctx));
+    ctx->key = PSA_KEY_ID_NULL;
 
-#if LIBSSH2_AES_GCM
-    /* Check if this is a GCM algorithm */
-    if(algo == MBEDTLS_CIPHER_AES_128_GCM ||
-       algo == MBEDTLS_CIPHER_AES_256_GCM) {
-        unsigned int keybits;
-
-        ctx->is_aesgcm = 1;
-
-        /* Store the initial IV (will be incremented per packet) */
-        memcpy(ctx->u.gcm.iv, iv, sizeof(ctx->u.gcm.iv));
-
-        /* Initialize GCM context */
-        mbedtls_gcm_init(&ctx->u.gcm.ctx);
-
-        /* Set key length based on algorithm */
-        if(algo == MBEDTLS_CIPHER_AES_128_GCM)
-            keybits = 128;
-        else /* MBEDTLS_CIPHER_AES_256_GCM */
-            keybits = 256;
-
-        /* Setup GCM with AES cipher and key */
-        if(mbedtls_gcm_setkey(&ctx->u.gcm.ctx, MBEDTLS_CIPHER_ID_AES,
-                              secret, keybits)) {
-            mbedtls_gcm_free(&ctx->u.gcm.ctx);
-            return -1;
-        }
-
-        return 0;
-    }
-#endif
-
-    /* Non-GCM algorithms: use cipher API */
-    op = encrypt ? MBEDTLS_ENCRYPT : MBEDTLS_DECRYPT;
-
-    cipher_info = mbedtls_cipher_info_from_type(algo);
-    if(!cipher_info)
+    if(mbed_cipher_params(algo, &type, &bits, &alg, &is_aead))
         return -1;
 
-    mbedtls_cipher_init(&ctx->u.cipher);
-    ret = mbedtls_cipher_setup(&ctx->u.cipher, cipher_info);
+    psa_set_key_type(&attributes, type);
+    psa_set_key_bits(&attributes, bits);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_usage_flags(&attributes, encrypt ? PSA_KEY_USAGE_ENCRYPT :
+                                                   PSA_KEY_USAGE_DECRYPT);
 
-    /* libssh2 computes and adds SSH packet padding itself, so for CBC
-       tell mbedTLS to expect no padding on the cipher layer. Only call
-       set_padding_mode for CBC ciphers since other modes (CTR, stream)
-       are not applicable and causes an error. */
-    if(!ret &&
-       (algo == MBEDTLS_CIPHER_AES_128_CBC ||
-        algo == MBEDTLS_CIPHER_AES_192_CBC ||
-        algo == MBEDTLS_CIPHER_AES_256_CBC
-#if LIBSSH2_3DES
-        || algo == MBEDTLS_CIPHER_DES_EDE3_CBC
-#endif
-       )
-      ) {
-        ret = mbedtls_cipher_set_padding_mode(&ctx->u.cipher,
-                                              MBEDTLS_PADDING_NONE);
+    if(psa_import_key(&attributes, secret, bits / 8, &ctx->key) !=
+       PSA_SUCCESS) {
+        ctx->key = PSA_KEY_ID_NULL;
+        return -1;
     }
 
-    if(!ret)
-        ret = mbedtls_cipher_setkey(&ctx->u.cipher, secret,
-                  (int)mbedtls_cipher_info_get_key_bitlen(cipher_info), op);
+    ctx->alg = alg;
+    ctx->is_aead = is_aead;
 
-    if(!ret)
-        ret = mbedtls_cipher_set_iv(&ctx->u.cipher, iv,
-                  mbedtls_cipher_info_get_iv_size(cipher_info));
+    if(is_aead) {
+        /* The operation is set up per packet, the IV is bumped after each */
+        memcpy(ctx->iv, iv, sizeof(ctx->iv));
+        return 0;
+    }
 
-    if(ret)
-        mbedtls_cipher_free(&ctx->u.cipher);
+    /* This operation stays open: the CBC/CTR chaining state must carry
+       across ssh2_cipher_crypt() calls, so it is never finished. */
+    ctx->op.cipher = psa_cipher_operation_init();
+    if((encrypt ? psa_cipher_encrypt_setup(&ctx->op.cipher, ctx->key, alg) :
+                  psa_cipher_decrypt_setup(&ctx->op.cipher, ctx->key, alg))
+       != PSA_SUCCESS ||
+       psa_cipher_set_iv(&ctx->op.cipher, iv,
+                         PSA_CIPHER_IV_LENGTH(type, alg)) != PSA_SUCCESS) {
+        ssh2_cipher_dtor(ctx);
+        return -1;
+    }
 
-    return ret == 0 ? 0 : -1;
+    return 0;
 }
+
+/* Chunk size for the non-AEAD path. PSA is not specified for in-place
+   operation, so data goes through a stack buffer a piece at a time; that
+   needs no allocation (there is no session to allocate from here) and
+   puts no limit on the length passed in. The extra 16 bytes are the
+   output slack PSA requires from block ciphers. */
+#define MBED_CIPHER_CHUNK 64
+
+#if LIBSSH2_AES_GCM
+/* Largest block the transport hands to an AEAD cipher: the last payload
+   slice (up to 15 bytes) merged with the 16-byte tag */
+#define MBED_AEAD_MAX_BLOCK 32
+#define MBED_AEAD_TAG_LEN   16
+
+static int mbed_aead_crypt(ssh2_cipher_ctx *ctx, int encrypt,
+                           unsigned char *block, size_t blocksize,
+                           int firstlast)
+{
+    unsigned char buf[PSA_AEAD_UPDATE_OUTPUT_SIZE(PSA_KEY_TYPE_AES,
+                                                  PSA_ALG_GCM,
+                                                  MBED_AEAD_MAX_BLOCK)];
+    unsigned char tag[MBED_AEAD_TAG_LEN];
+    const size_t aadlen = IS_FIRST(firstlast) ? 4 : 0;
+    const size_t taglen = IS_LAST(firstlast) ? MBED_AEAD_TAG_LEN : 0;
+    size_t cryptlen, olen;
+    int ret = -1;
+
+    if(blocksize > MBED_AEAD_MAX_BLOCK || blocksize < aadlen + taglen)
+        return -1;
+
+    cryptlen = blocksize - aadlen - taglen;
+
+    /* First block: start the operation and feed the AAD */
+    if(IS_FIRST(firstlast)) {
+        (void)psa_aead_abort(&ctx->op.aead);
+        ctx->op.aead = psa_aead_operation_init();
+        ctx->aead_active = 0;
+
+        if((encrypt ? psa_aead_encrypt_setup(&ctx->op.aead, ctx->key,
+                                             ctx->alg) :
+                      psa_aead_decrypt_setup(&ctx->op.aead, ctx->key,
+                                             ctx->alg)) != PSA_SUCCESS)
+            return -1;
+        ctx->aead_active = 1;
+
+        if(psa_aead_set_nonce(&ctx->op.aead, ctx->iv, sizeof(ctx->iv)) !=
+           PSA_SUCCESS ||
+           psa_aead_update_ad(&ctx->op.aead, block, aadlen) != PSA_SUCCESS)
+            goto fail;
+    }
+    else if(!ctx->aead_active)
+        return -1;
+
+    /* The output must come back whole: libssh2 needs it in place and
+       the same length. */
+    if(cryptlen > 0) {
+        olen = 0;
+        if(psa_aead_update(&ctx->op.aead, block + aadlen, cryptlen,
+                           buf, sizeof(buf), &olen) != PSA_SUCCESS ||
+           olen != cryptlen)
+            goto fail;
+        memcpy(block + aadlen, buf, olen);
+    }
+
+    ret = 0;
+
+    /* Last block: the tag is written on encrypt, checked on decrypt */
+    if(IS_LAST(firstlast)) {
+        size_t flen = 0, tlen = 0;
+        int i;
+
+        if(encrypt) {
+            if(psa_aead_finish(&ctx->op.aead, buf, sizeof(buf), &flen,
+                               tag, sizeof(tag), &tlen) != PSA_SUCCESS ||
+               tlen != sizeof(tag) || flen)
+                ret = -1;
+            else
+                memcpy(block + blocksize - sizeof(tag), tag, sizeof(tag));
+        }
+        else if(psa_aead_verify(&ctx->op.aead, buf, sizeof(buf), &flen,
+                                block + blocksize - sizeof(tag),
+                                sizeof(tag)) != PSA_SUCCESS || flen)
+            ret = -1;
+
+        ctx->aead_active = 0;
+        (void)psa_aead_abort(&ctx->op.aead);
+
+        /* Increment the invocation counter for the next packet */
+        for(i = 11; i >= 4; i--)
+            if(++ctx->iv[i])
+                break;
+    }
+
+    ssh2_explicit_zero(buf, sizeof(buf));
+    return ret;
+
+fail:
+    ctx->aead_active = 0;
+    (void)psa_aead_abort(&ctx->op.aead);
+    ssh2_explicit_zero(buf, sizeof(buf));
+    return -1;
+}
+#endif /* LIBSSH2_AES_GCM */
 
 int ssh2_cipher_crypt(ssh2_cipher_ctx *ctx, SSH2_CIPHER_T(algo),
                       int encrypt, unsigned char *block, size_t blocksize,
                       int firstlast)
 {
-    int ret;
-    unsigned char *output;
-    size_t osize, olen, finish_olen;
+    unsigned char buf[MBED_CIPHER_CHUNK + 16];
+    size_t done = 0;
+    int ret = 0;
 
     if(!ctx)
         return -1;
@@ -164,104 +288,30 @@ int ssh2_cipher_crypt(ssh2_cipher_ctx *ctx, SSH2_CIPHER_T(algo),
     (void)algo;
 
 #if LIBSSH2_AES_GCM
-    if(ctx->is_aesgcm) {
-        unsigned char buf[32];
-        unsigned char tag[16];  /* GCM authentication tag */
-        const int authlen = sizeof(tag);
-        const int aadlen = IS_FIRST(firstlast) ? 4 : 0;
-        const int authenticationtag = IS_LAST(firstlast) ? authlen : 0;
-        size_t cryptlen; /* length of encrypt */
-
-        if(blocksize > sizeof(buf) ||
-           blocksize < (size_t)(aadlen + authenticationtag))
-            return -1;
-
-        cryptlen = blocksize - aadlen - authenticationtag;
-
-        /* First block: start GCM operation */
-        if(IS_FIRST(firstlast)) {
-            if(mbedtls_gcm_starts(&ctx->u.gcm.ctx,
-                                  encrypt ? MBEDTLS_GCM_ENCRYPT
-                                          : MBEDTLS_GCM_DECRYPT,
-                                  ctx->u.gcm.iv, sizeof(ctx->u.gcm.iv)))
-                return -1;
-
-            /* Process AAD (Additional Authenticated Data) */
-            if(aadlen && mbedtls_gcm_update_ad(&ctx->u.gcm.ctx, block, aadlen))
-                return -1;
-        }
-
-        /* Process payload */
-        if(cryptlen > 0) {
-            olen = 0;
-            if(mbedtls_gcm_update(&ctx->u.gcm.ctx,
-                                  block + aadlen, cryptlen,
-                                  buf, cryptlen, &olen))
-                return -1;
-            memcpy(block + aadlen, buf, olen);
-        }
-
-        ret = 0;
-
-        /* Last block: finalize and handle authentication tag */
-        if(IS_LAST(firstlast)) {
-            unsigned char finish_buf[16];
-            int i;
-
-            finish_olen = 0;
-            if(mbedtls_gcm_finish(&ctx->u.gcm.ctx,
-                                  finish_buf, sizeof(finish_buf),
-                                  &finish_olen, tag, authlen))
-                return -1;
-
-            if(encrypt)
-                memcpy(block + blocksize - authlen, tag, authlen);
-            else if(ssh2_timingsafe_bcmp(tag, block + blocksize - authlen,
-                                         authlen))
-                ret = -1;  /* GCM auth failed */
-
-            /* Increment IV for next packet */
-            for(i = 11; i >= 4; i--)
-                if(++ctx->u.gcm.iv[i])
-                    break;
-        }
-
-        return ret;
-    }
+    if(ctx->is_aead)
+        return mbed_aead_crypt(ctx, encrypt, block, blocksize, firstlast);
 #else
     (void)encrypt;
-    (void)algo;
     (void)firstlast;
 #endif
 
-    /* Non-GCM algorithms: use standard cipher API */
-    osize = blocksize + mbedtls_cipher_get_block_size(&ctx->u.cipher);
+    while(!ret && done < blocksize) {
+        size_t n = blocksize - done, olen = 0;
 
-    output = mbedtls_calloc(osize, sizeof(char));
-    if(output) {
-        olen = 0;
-        finish_olen = 0;
+        if(n > MBED_CIPHER_CHUNK)
+            n = MBED_CIPHER_CHUNK;
 
-        ret = mbedtls_cipher_reset(&ctx->u.cipher);
-        if(!ret)
-            ret = mbedtls_cipher_update(&ctx->u.cipher, block,
-                                        blocksize, output, &olen);
-        if(!ret)
-            ret = mbedtls_cipher_finish(&ctx->u.cipher,
-                                        output + olen, &finish_olen);
-        if(!ret) {
-            olen += finish_olen;
-            memcpy(block, output, olen);
-        }
-
-        if(osize)
-            ssh2_explicit_zero(output, osize * sizeof(char));
-        mbedtls_free(output);
+        if(psa_cipher_update(&ctx->op.cipher, block + done, n,
+                             buf, sizeof(buf), &olen) != PSA_SUCCESS ||
+           olen != n)
+            ret = -1;
+        else
+            memcpy(block + done, buf, n);
+        done += n;
     }
-    else
-        ret = -1;
 
-    return ret == 0 ? 0 : -1;
+    ssh2_explicit_zero(buf, sizeof(buf));
+    return ret;
 }
 
 void ssh2_cipher_dtor(ssh2_cipher_ctx *ctx)
@@ -269,14 +319,15 @@ void ssh2_cipher_dtor(ssh2_cipher_ctx *ctx)
     if(!ctx)
         return;
 
-#if LIBSSH2_AES_GCM
-    if(ctx->is_aesgcm) {
-        mbedtls_gcm_free(&ctx->u.gcm.ctx);
-        return;
-    }
-#endif
+    if(ctx->is_aead)
+        (void)psa_aead_abort(&ctx->op.aead);
+    else if(ctx->key != PSA_KEY_ID_NULL)
+        (void)psa_cipher_abort(&ctx->op.cipher);
 
-    mbedtls_cipher_free(&ctx->u.cipher);
+    if(ctx->key != PSA_KEY_ID_NULL)
+        psa_destroy_key(ctx->key);
+
+    ssh2_explicit_zero(ctx, sizeof(*ctx));
 }
 
 int ssh2_hash_init(ssh2_hash_ctx *ctx, ssh2_hash_alg alg)

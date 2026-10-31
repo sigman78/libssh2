@@ -52,10 +52,6 @@
 #endif
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
 #include <mbedtls/bignum.h>
-#include <mbedtls/cipher.h>
-#ifdef MBEDTLS_GCM_C
-# include <mbedtls/gcm.h>
-#endif
 #include <mbedtls/psa_util.h>  /* mbedtls_psa_get_random() */
 #endif
 #include <mbedtls/pk.h>
@@ -78,9 +74,20 @@
 #define LIBSSH2_HMAC_SHA256 1
 #define LIBSSH2_HMAC_SHA512 1
 
+#if defined(PSA_WANT_KEY_TYPE_AES) && PSA_WANT_KEY_TYPE_AES && \
+    defined(PSA_WANT_ALG_CBC_NO_PADDING) && PSA_WANT_ALG_CBC_NO_PADDING
 #define LIBSSH2_AES_CBC 1
+#else
+#define LIBSSH2_AES_CBC 0
+#endif
+#if defined(PSA_WANT_KEY_TYPE_AES) && PSA_WANT_KEY_TYPE_AES && \
+    defined(PSA_WANT_ALG_CTR) && PSA_WANT_ALG_CTR
 #define LIBSSH2_AES_CTR 1
-#ifdef MBEDTLS_GCM_C
+#else
+#define LIBSSH2_AES_CTR 0
+#endif
+#if defined(PSA_WANT_KEY_TYPE_AES) && PSA_WANT_KEY_TYPE_AES && \
+    defined(PSA_WANT_ALG_GCM) && PSA_WANT_ALG_GCM
 #define LIBSSH2_AES_GCM 1
 #else
 #define LIBSSH2_AES_GCM 0
@@ -88,7 +95,8 @@
 #define LIBSSH2_BLOWFISH 0
 #define LIBSSH2_RC4 0
 #define LIBSSH2_CAST 0
-#ifdef MBEDTLS_DES_C
+#if defined(PSA_WANT_KEY_TYPE_DES) && PSA_WANT_KEY_TYPE_DES && \
+    defined(PSA_WANT_ALG_CBC_NO_PADDING) && PSA_WANT_ALG_CBC_NO_PADDING
 #define LIBSSH2_3DES 1
 #else
 #define LIBSSH2_3DES 0
@@ -180,38 +188,50 @@ typedef enum {
  * mbedTLS backend: Cipher Context structure
  */
 
-/* Unified cipher context structure.
-   Handles both regular ciphers and AEAD ciphers (GCM)
-   using a union to optimize memory usage. */
+typedef enum {
+    MBED_CIPHER_AES128_CTR,
+    MBED_CIPHER_AES192_CTR,
+    MBED_CIPHER_AES256_CTR,
+    MBED_CIPHER_AES128_CBC,
+    MBED_CIPHER_AES192_CBC,
+    MBED_CIPHER_AES256_CBC,
+    MBED_CIPHER_3DES_CBC,
+    MBED_CIPHER_AES128_GCM,
+    MBED_CIPHER_AES256_GCM,
+    MBED_CIPHER_CHACHA20_POLY1305  /* placeholder, never implemented */
+} ssh2_mbed_cipher_type;
+
+/* The key lives in the PSA key store. A plain cipher keeps one PSA
+   operation open for the life of the context; an AEAD cipher sets up an
+   operation per packet and keeps the IV (bumped after each packet). */
 struct ssh2_mbed_cipher_ctx {
-    int is_aesgcm;
+    psa_key_id_t key;
+    psa_algorithm_t alg;
+    int is_aead;
+    int aead_active;  /* an operation is open between FIRST and LAST */
     union {
-        mbedtls_cipher_context_t cipher;
-#if LIBSSH2_AES_GCM
-        struct {
-            mbedtls_gcm_context ctx;
-            unsigned char iv[12];
-        } gcm;
-#endif
-    } u;
+        psa_cipher_operation_t cipher;
+        psa_aead_operation_t aead;
+    } op;
+    unsigned char iv[12];
 };
 
 #define ssh2_cipher_ctx        struct ssh2_mbed_cipher_ctx
 
-#define SSH2_CIPHER_T(algo)    mbedtls_cipher_type_t algo
+#define SSH2_CIPHER_T(algo)    ssh2_mbed_cipher_type algo
 
-#define ssh2_cipher_aes256ctr  MBEDTLS_CIPHER_AES_256_CTR
-#define ssh2_cipher_aes192ctr  MBEDTLS_CIPHER_AES_192_CTR
-#define ssh2_cipher_aes128ctr  MBEDTLS_CIPHER_AES_128_CTR
-#define ssh2_cipher_aes256     MBEDTLS_CIPHER_AES_256_CBC
-#define ssh2_cipher_aes192     MBEDTLS_CIPHER_AES_192_CBC
-#define ssh2_cipher_aes128     MBEDTLS_CIPHER_AES_128_CBC
+#define ssh2_cipher_aes256ctr  MBED_CIPHER_AES256_CTR
+#define ssh2_cipher_aes192ctr  MBED_CIPHER_AES192_CTR
+#define ssh2_cipher_aes128ctr  MBED_CIPHER_AES128_CTR
+#define ssh2_cipher_aes256     MBED_CIPHER_AES256_CBC
+#define ssh2_cipher_aes192     MBED_CIPHER_AES192_CBC
+#define ssh2_cipher_aes128     MBED_CIPHER_AES128_CBC
 #if LIBSSH2_3DES
-#define ssh2_cipher_3des       MBEDTLS_CIPHER_DES_EDE3_CBC
+#define ssh2_cipher_3des       MBED_CIPHER_3DES_CBC
 #endif
-#define ssh2_cipher_aes128gcm  MBEDTLS_CIPHER_AES_128_GCM
-#define ssh2_cipher_aes256gcm  MBEDTLS_CIPHER_AES_256_GCM
-#define ssh2_cipher_chacha20   MBEDTLS_CIPHER_CHACHA20_POLY1305
+#define ssh2_cipher_aes128gcm  MBED_CIPHER_AES128_GCM
+#define ssh2_cipher_aes256gcm  MBED_CIPHER_AES256_GCM
+#define ssh2_cipher_chacha20   MBED_CIPHER_CHACHA20_POLY1305
 
 /*******************************************************************/
 /*
