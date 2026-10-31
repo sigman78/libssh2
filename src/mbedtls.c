@@ -1027,15 +1027,14 @@ static int mbed_ecdsa_names(size_t bits, const char **method,
 /* Builds the method || curve || point public key blob of a PSA ECC key.
    The PSA public key export is already the uncompressed SSH point. */
 static int mbed_ecdsa_pubkey(LIBSSH2_SESSION *session, psa_key_id_t key,
-                             size_t bits, unsigned char **pubkeydata,
+                             const char *method, const char *curve,
+                             unsigned char **pubkeydata,
                              size_t *pubkeydata_len)
 {
     unsigned char point[EC_MAX_POINT_LEN], *blob, *bp;
-    const char *method, *curve;
     size_t point_len, method_len, curve_len, len;
 
-    if(mbed_ecdsa_names(bits, &method, &curve) ||
-       psa_export_public_key(key, point, sizeof(point),
+    if(psa_export_public_key(key, point, sizeof(point),
                              &point_len) != PSA_SUCCESS)
         return -1;
 
@@ -1054,6 +1053,7 @@ static int mbed_ecdsa_pubkey(LIBSSH2_SESSION *session, psa_key_id_t key,
     *pubkeydata_len = len;
     return 0;
 }
+
 /* Right-aligns an unsigned big-endian number into n bytes. Fails if it
    does not fit; surplus leading zeros and short numbers are fine. */
 static int mbed_uint_fixed(unsigned char *dst, size_t n,
@@ -1082,6 +1082,7 @@ static int mbed_parse_openssh_key(psa_key_id_t *ctx,
     char *name = NULL;
     unsigned char *curvebuf, *exponent, *pointbuf, *d = NULL;
     size_t name_len, curvebuf_len, exponent_len, pointbuf_len, n = 0;
+    const char *method, *curve_name;
     ssh2_curve_type curve;
     int ret = -1;
 
@@ -1094,6 +1095,13 @@ static int mbed_parse_openssh_key(psa_key_id_t *ctx,
        ssh2_get_string(decrypted, &curvebuf, &curvebuf_len) ||
        ssh2_get_string(decrypted, &pointbuf, &pointbuf_len) ||
        ssh2_get_bignum_bytes(decrypted, &exponent, &exponent_len))
+        goto cleanup;
+
+    /* the stored curve name must agree with the key type; the stored
+       point is ignored, the public key is derived from the scalar */
+    if(mbed_ecdsa_names(curve, &method, &curve_name) ||
+       curvebuf_len != strlen(curve_name) ||
+       memcmp(curvebuf, curve_name, curvebuf_len))
         goto cleanup;
 
     /* PSA wants the private scalar exactly curve-sized, the mpint is not */
@@ -1141,8 +1149,8 @@ static int mbed_ecdsa_openssh_pub(LIBSSH2_SESSION *session, char **method,
 
     if(mbed_key_bits(key, &bits) == 0 &&
        mbed_ecdsa_names(bits, &method_name, &curve_name) == 0 &&
-       mbed_ecdsa_pubkey(session, key, bits, pubkeydata,
-                         pubkeydata_len) == 0) {
+       mbed_ecdsa_pubkey(session, key, method_name, curve_name,
+                         pubkeydata, pubkeydata_len) == 0) {
         ret = mbed_method_dup(session, method, method_name, pubkeydata,
                               pubkeydata_len);
     }
@@ -1198,7 +1206,7 @@ static int mbed_pub_priv_key(LIBSSH2_SESSION *session, char **method,
     if(PSA_KEY_TYPE_IS_ECC(type) &&
        PSA_KEY_TYPE_ECC_GET_FAMILY(type) == PSA_ECC_FAMILY_SECP_R1 &&
        mbed_ecdsa_names(bits, &method_name, &curve_name) == 0) {
-        ret = mbed_ecdsa_pubkey(session, key, bits,
+        ret = mbed_ecdsa_pubkey(session, key, method_name, curve_name,
                                 pubkeydata, pubkeydata_len);
     }
     else
@@ -1363,31 +1371,41 @@ int ssh2_ecdsa_create_key(ssh2_ec_key **ec_ctx, LIBSSH2_SESSION *session,
 {
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     size_t size = PSA_EXPORT_PUBLIC_KEY_OUTPUT_SIZE(MBED_ECC_PUBLIC, curve);
-    unsigned char *pub;
+    unsigned char *pub = NULL;
     int ret = -1;
 
-    *out_public_key_octal = NULL;
+    if(out_public_key_octal)
+        *out_public_key_octal = NULL;
     *ec_ctx = mbed_key_alloc(session);
     if(!*ec_ctx)
         return -1;
 
-    pub = SSH2_ALLOC(session, size);
-    if(pub) {
-        psa_set_key_type(&attr, MBED_ECC_PAIR);
-        psa_set_key_bits(&attr, curve);
-        psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_DERIVE);
-        psa_set_key_algorithm(&attr, PSA_ALG_ECDH);
-        if(psa_generate_key(&attr, *ec_ctx) == PSA_SUCCESS &&
-           psa_export_public_key(**ec_ctx, pub, size,
-                                 out_public_key_octal_len) == PSA_SUCCESS) {
-            *out_public_key_octal = pub;
-            ret = 0;
-        }
-        psa_reset_key_attributes(&attr);
+    /* the caller may only want the key, not its point */
+    if(out_public_key_octal) {
+        pub = SSH2_ALLOC(session, size);
+        if(!pub)
+            goto cleanup;
     }
 
+    psa_set_key_type(&attr, MBED_ECC_PAIR);
+    psa_set_key_bits(&attr, curve);
+    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_DERIVE);
+    psa_set_key_algorithm(&attr, PSA_ALG_ECDH);
+    if(psa_generate_key(&attr, *ec_ctx) == PSA_SUCCESS &&
+       (!pub || psa_export_public_key(**ec_ctx, pub, size,
+                                      out_public_key_octal_len) ==
+        PSA_SUCCESS)) {
+        if(pub)
+            *out_public_key_octal = pub;
+        ret = 0;
+    }
+    psa_reset_key_attributes(&attr);
+
+cleanup:
+
     if(ret) {
-        SSH2_FREE(session, pub);
+        if(pub)
+            SSH2_FREE(session, pub);
         mbed_key_free(*ec_ctx, session);
         *ec_ctx = NULL;
     }
@@ -1557,7 +1575,9 @@ int ssh2_ecdsa_sign(ssh2_ecdsa_ctx *ec_ctx, LIBSSH2_SESSION *session,
     unsigned char raw[2 * PSA_BITS_TO_BYTES(521)], *sig, *sp;
     size_t bits, n, raw_len;
 
-    if(hash_alg == PSA_ALG_NONE || mbed_key_bits(*ec_ctx, &bits))
+    /* the digest must be the one the curve calls for */
+    if(hash_alg == PSA_ALG_NONE || mbed_key_bits(*ec_ctx, &bits) ||
+       mbed_ecdsa_curve_hash(bits) != hash_alg)
         return -1;
 
     n = PSA_BITS_TO_BYTES(bits);
