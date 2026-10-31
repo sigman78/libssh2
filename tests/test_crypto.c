@@ -702,6 +702,62 @@ fail:
     return rc;
 }
 
+#ifdef LIBSSH2_MBEDTLS
+/* Keys this backend cannot use must fail cleanly, with the right error */
+static int check_pub_privkey_errors(LIBSSH2_SESSION *session)
+{
+    static const char garbage[] = "this is not a private key\n";
+    static const char junk[] = "\xef\xbb\xbf# made by hand\n";
+    char *method = NULL, *file = NULL, *pre = NULL;
+    unsigned char *pubkey = NULL, *expected = NULL;
+    size_t pubkey_len = 0, file_len = 0, expected_len = 0;
+    int rc = 1;
+
+    /* OpenSSH-format RSA is not read by this backend */
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            keypath("id_rsa_openssh"), NULL, 0, NULL) != 0);
+    EXPECT(!method && !pubkey && pubkey_len == 0);
+
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            NULL, garbage, sizeof(garbage) - 1, NULL) ==
+           LIBSSH2_ERROR_FILE);
+    EXPECT(!method && !pubkey && pubkey_len == 0);
+
+    /* encrypted PKCS#8: wrong and missing passphrase */
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            keypath("id_ecdsa_pkcs8_encrypted"), NULL, 0,
+                            "wrong") == LIBSSH2_ERROR_KEYFILE_AUTH_FAILED);
+    EXPECT(!method && !pubkey && pubkey_len == 0);
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            keypath("id_ecdsa_pkcs8_encrypted"), NULL, 0,
+                            NULL) == LIBSSH2_ERROR_KEYFILE_AUTH_FAILED);
+    EXPECT(!method && !pubkey && pubkey_len == 0);
+
+    /* a byte order mark and a comment before an OpenSSH header */
+    EXPECT(read_pub_blob(session, "id_ecdsa_openssh",
+                         &expected, &expected_len) == 0);
+    EXPECT(ssh2_file_to_blob(session, keypath("id_ecdsa_openssh"),
+                             &file, &file_len) == 0);
+    pre = SSH2_ALLOC(session, file_len + sizeof(junk));
+    EXPECT(pre);
+    memcpy(pre, junk, sizeof(junk) - 1);
+    memcpy(pre + sizeof(junk) - 1, file, file_len);
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len, NULL,
+                            pre, file_len + sizeof(junk) - 1, NULL) == 0);
+    EXPECT(pubkey_len == expected_len);
+    EXPECT(memcmp(pubkey, expected, expected_len) == 0);
+    rc = 0;
+
+fail:
+    SSH2_FREE(session, method);
+    SSH2_FREE(session, pubkey);
+    SSH2_FREE(session, expected);
+    SSH2_FREE(session, pre);
+    ssh2_zero_free(session, file, file_len + 1);
+    return rc;
+}
+#endif
+
 static int test_ecdsa(LIBSSH2_SESSION *session)
 {
     static const struct {
@@ -877,6 +933,11 @@ static int test_ecdsa(LIBSSH2_SESSION *session)
 
     if(check_cert_signature(session))
         goto fail;
+
+#ifdef LIBSSH2_MBEDTLS
+    if(check_pub_privkey_errors(session))
+        goto fail;
+#endif
 
     ssh2_ecdsa_free(priv, session);
     ssh2_ecdsa_free(pub, session);
