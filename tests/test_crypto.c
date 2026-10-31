@@ -758,6 +758,59 @@ fail:
 }
 #endif
 
+#ifdef LIBSSH2_MBEDTLS
+/* A wrong passphrase on an OpenSSH key and a key of another type are
+   reported as such by every loader */
+static int check_loader_errors(LIBSSH2_SESSION *session)
+{
+    char *method = NULL;
+    unsigned char *pubkey = NULL;
+    size_t pubkey_len = 0;
+    ssh2_ecdsa_ctx *ec = NULL;
+    int rc = 1;
+
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            keypath("id_ecdsa_openssh_encrypted"),
+                            NULL, 0, "wrong") ==
+           LIBSSH2_ERROR_KEYFILE_AUTH_FAILED);
+    EXPECT(libssh2_session_last_errno(session) ==
+           LIBSSH2_ERROR_KEYFILE_AUTH_FAILED);
+    EXPECT(!method && !pubkey && pubkey_len == 0);
+
+    /* OpenSSH RSA: an unsupported key type */
+    EXPECT(ssh2_ecdsa_new_priv(&ec, session, keypath("id_rsa_openssh"),
+                               NULL, 0, NULL) == -1);
+    EXPECT(libssh2_session_last_errno(session) == LIBSSH2_ERROR_FILE);
+    EXPECT(!ec);
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            keypath("id_rsa_openssh"), NULL, 0, NULL) != 0);
+    EXPECT(libssh2_session_last_errno(session) == LIBSSH2_ERROR_FILE);
+    EXPECT(!method && !pubkey && pubkey_len == 0);
+
+#if LIBSSH2_RSA
+    {
+        ssh2_rsa_ctx *rsa = NULL;
+
+        EXPECT(ssh2_ecdsa_new_priv(&ec, session, keypath("id_rsa_pem"),
+                                   NULL, 0, NULL) == -1);
+        EXPECT(libssh2_session_last_errno(session) == LIBSSH2_ERROR_FILE);
+        EXPECT(!ec);
+        EXPECT(ssh2_rsa_new_priv(&rsa, session, keypath("id_ecdsa_pem"),
+                                 NULL, 0, NULL) == -1);
+        EXPECT(libssh2_session_last_errno(session) == LIBSSH2_ERROR_FILE);
+        EXPECT(!rsa);
+    }
+#endif
+    rc = 0;
+
+fail:
+    SSH2_FREE(session, method);
+    SSH2_FREE(session, pubkey);
+    ssh2_ecdsa_free(ec, session);
+    return rc;
+}
+#endif
+
 static int test_ecdsa(LIBSSH2_SESSION *session)
 {
     static const struct {
@@ -924,6 +977,10 @@ static int test_ecdsa(LIBSSH2_SESSION *session)
     EXPECT(ssh2_ecdsa_new_priv(&priv, session,
                                keypath("id_ecdsa_openssh_encrypted"),
                                NULL, 0, "wrong") != 0);
+#ifdef LIBSSH2_MBEDTLS
+    EXPECT(libssh2_session_last_errno(session) ==
+           LIBSSH2_ERROR_KEYFILE_AUTH_FAILED);
+#endif
     EXPECT(!priv);
 
     /* ECDH on every curve */
@@ -936,6 +993,8 @@ static int test_ecdsa(LIBSSH2_SESSION *session)
 
 #ifdef LIBSSH2_MBEDTLS
     if(check_pub_privkey_errors(session))
+        goto fail;
+    if(check_loader_errors(session))
         goto fail;
 #endif
 
