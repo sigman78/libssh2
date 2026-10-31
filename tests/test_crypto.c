@@ -255,7 +255,7 @@ static int check_rsa_hostkey_blob(LIBSSH2_SESSION *session,
     ssh2_rsa_ctx *pub = NULL;
     int rc = 1;
 
-    buf.data = buf.dataptr = (unsigned char *)blob;
+    buf.data = buf.dataptr = (unsigned char *)SSH2_UNCONST(blob);
     buf.len = blob_len;
     EXPECT(ssh2_get_string(&buf, &name, &name_len) == 0);
     EXPECT(ssh2_get_string(&buf, &e, &e_len) == 0);
@@ -298,6 +298,8 @@ static int check_rsa_leading_zero(LIBSSH2_SESSION *session,
 
     EXPECT(rsa_verify_sha256(session, pub, sig, sig_len,
                              (unsigned char *)msg, strlen(msg)) == 0);
+#ifdef LIBSSH2_MBEDTLS
+    /* only this backend promises to take stripped and padded signatures */
     EXPECT(rsa_verify_sha256(session, pub, sig + 1, sig_len - 1,
                              (unsigned char *)msg, strlen(msg)) == 0);
 
@@ -309,6 +311,7 @@ static int check_rsa_leading_zero(LIBSSH2_SESSION *session,
     alt[0] = 1;
     EXPECT(rsa_verify_sha256(session, pub, alt, sig_len + 1,
                              (unsigned char *)msg, strlen(msg)) != 0);
+#endif
     rc = 0;
 
 fail:
@@ -420,9 +423,13 @@ static int test_rsa(LIBSSH2_SESSION *session)
         const char *passphrase;
     } keys[] = {
         { "id_rsa_pem", NULL },
-        { "id_rsa_pkcs8", NULL },
+#if LIBSSH2_MD5_PEM && LIBSSH2_AES_CBC
         { "id_rsa_pem_encrypted", "libssh2" },
-        { "id_rsa_pkcs8_encrypted", "libssh2" }
+#endif
+#if !defined(LIBSSH2_LIBGCRYPT) && !defined(LIBSSH2_WINCNG)
+        { "id_rsa_pkcs8", NULL },
+        { "id_rsa_pkcs8_encrypted", "libssh2" },
+#endif
     };
     const unsigned char msg[] = "the quick brown fox";
     unsigned char tampered[sizeof(msg)];
@@ -706,14 +713,18 @@ static int test_ecdsa(LIBSSH2_SESSION *session)
     } keys[] = {
         { "id_ecdsa_pem", NULL, "ecdsa-sha2-nistp521", 521,
           SSH2_EC_CURVE_NISTP521 },
+#if !defined(LIBSSH2_LIBGCRYPT) && !defined(LIBSSH2_WINCNG)
         { "id_ecdsa_pkcs8", NULL, "ecdsa-sha2-nistp384", 384,
           SSH2_EC_CURVE_NISTP384 },
-        { "id_ecdsa_openssh", NULL, "ecdsa-sha2-nistp384", 384,
-          SSH2_EC_CURVE_NISTP384 },
-        { "id_ecdsa_pem_encrypted", "libssh2", "ecdsa-sha2-nistp256", 256,
-          SSH2_EC_CURVE_NISTP256 },
         { "id_ecdsa_pkcs8_encrypted", "libssh2", "ecdsa-sha2-nistp521", 521,
           SSH2_EC_CURVE_NISTP521 },
+#endif
+        { "id_ecdsa_openssh", NULL, "ecdsa-sha2-nistp384", 384,
+          SSH2_EC_CURVE_NISTP384 },
+#if LIBSSH2_MD5_PEM && LIBSSH2_AES_CBC
+        { "id_ecdsa_pem_encrypted", "libssh2", "ecdsa-sha2-nistp256", 256,
+          SSH2_EC_CURVE_NISTP256 },
+#endif
         { "id_ecdsa_openssh_encrypted", "libssh2", "ecdsa-sha2-nistp256", 256,
           SSH2_EC_CURVE_NISTP256 },
         /* OpenSSH format: 66-byte P-521 scalar padding, unencrypted P-256 */
@@ -953,7 +964,7 @@ static int cipher_kat(SSH2_CIPHER_T(algo), unsigned char *iv,
     int i, rc = 1;
 
     memcpy(buf, nist_pt, sizeof(buf));
-    if(ssh2_cipher_init(&c, algo, iv, (unsigned char *)nist_key, 1))
+    if(ssh2_cipher_init(&c, algo, iv, SSH2_UNCONST(nist_key), 1))
         FAIL("cipher init");
     for(i = 0; i < 2; i++) {
         if(ssh2_cipher_crypt(&c, algo, 1, buf[i], 16, MIDDLE_BLOCK)) {
@@ -965,7 +976,7 @@ static int cipher_kat(SSH2_CIPHER_T(algo), unsigned char *iv,
     EXPECT(memcmp(buf, ct, sizeof(buf)) == 0);
 
     /* and back */
-    if(ssh2_cipher_init(&c, algo, iv, (unsigned char *)nist_key, 0))
+    if(ssh2_cipher_init(&c, algo, iv, SSH2_UNCONST(nist_key), 0))
         FAIL("cipher init");
     for(i = 0; i < 2; i++) {
         if(ssh2_cipher_crypt(&c, algo, 0, buf[i], 16, MIDDLE_BLOCK)) {
@@ -997,10 +1008,11 @@ static int test_aes_ctr_kat(void)
         { 0x98, 0x06, 0xf6, 0x6b, 0x79, 0x70, 0xfd, 0xff,
           0x86, 0x17, 0x18, 0x7b, 0xb9, 0xff, 0xfd, 0xff }
     };
+    SSH2_CIPHER_T(algo) = ssh2_cipher_aes128ctr;
     unsigned char iv[16];
 
     memcpy(iv, ctr, sizeof(iv));
-    return cipher_kat(ssh2_cipher_aes128ctr, iv, ct);
+    return cipher_kat(algo, iv, ct);
 }
 #endif
 
@@ -1014,29 +1026,40 @@ static int test_aes_cbc_kat(void)
         { 0x50, 0x86, 0xcb, 0x9b, 0x50, 0x72, 0x19, 0xee,
           0x95, 0xdb, 0x11, 0x3a, 0x91, 0x76, 0x78, 0xb2 }
     };
+    SSH2_CIPHER_T(algo) = ssh2_cipher_aes128;
     unsigned char iv[16];
     int i;
 
     for(i = 0; i < 16; i++)
         iv[i] = (unsigned char)i;
-    return cipher_kat(ssh2_cipher_aes128, iv, ct);
+    return cipher_kat(algo, iv, ct);
 }
 #endif
 
 /* PSA has 32 volatile key slots: many init/crypt/dtor rounds only work
    if every round gives its slot back. FIRST_BLOCK leaves a GCM operation
    active, so this also checks that dtor aborts it. */
-static int cipher_slot_loop(const char *name, SSH2_CIPHER_T(algo),
-                            size_t keylen, size_t ivlen, size_t bs)
+/* Algorithm values are brace initialisers on some backends, so they can
+   only be written in an initialiser: keep them in tables. */
+struct cipher_case {
+    const char *name;
+    SSH2_CIPHER_T(algo);
+    size_t keylen;
+    size_t ivlen;
+    size_t bs;
+};
+
+static int cipher_slot_loop(const struct cipher_case *cc)
 {
+    const char *name = cc->name;
+    SSH2_CIPHER_T(algo) = cc->algo;
+    size_t bs = cc->bs;
     unsigned char key[32], iv[16], buf[16];
     ssh2_cipher_ctx c;
     int i;
 
     memset(key, 0x42, sizeof(key));
     memset(iv, 0x24, sizeof(iv));
-    (void)keylen;
-    (void)ivlen;
     for(i = 0; i < 48; i++) {
         memset(buf, 0, sizeof(buf));
         if(ssh2_cipher_init(&c, algo, iv, key, i & 1)) {
@@ -1093,22 +1116,29 @@ fail:
 
 static int test_cipher_slots(void)
 {
-    int rc = 0;
+    static const struct cipher_case cases[] = {
 #if LIBSSH2_AES_CTR
-    rc |= cipher_slot_loop("aes128-ctr", ssh2_cipher_aes128ctr, 16, 16, 16);
-    rc |= cipher_slot_loop("aes256-ctr", ssh2_cipher_aes256ctr, 32, 16, 16);
+        { "aes128-ctr", ssh2_cipher_aes128ctr, 16, 16, 16 },
+        { "aes256-ctr", ssh2_cipher_aes256ctr, 32, 16, 16 },
 #endif
 #if LIBSSH2_AES_CBC
-    rc |= cipher_slot_loop("aes128-cbc", ssh2_cipher_aes128, 16, 16, 16);
-    rc |= cipher_slot_loop("aes256-cbc", ssh2_cipher_aes256, 32, 16, 16);
+        { "aes128-cbc", ssh2_cipher_aes128, 16, 16, 16 },
+        { "aes256-cbc", ssh2_cipher_aes256, 32, 16, 16 },
 #endif
 #if LIBSSH2_3DES
-    rc |= cipher_slot_loop("3des-cbc", ssh2_cipher_3des, 24, 8, 8);
+        { "3des-cbc", ssh2_cipher_3des, 24, 8, 8 },
 #endif
 #if LIBSSH2_AES_GCM
-    rc |= cipher_slot_loop("aes128-gcm", ssh2_cipher_aes128gcm, 16, 12, 16);
-    rc |= cipher_slot_loop("aes256-gcm", ssh2_cipher_aes256gcm, 32, 12, 16);
+        { "aes128-gcm", ssh2_cipher_aes128gcm, 16, 12, 16 },
+        { "aes256-gcm", ssh2_cipher_aes256gcm, 32, 12, 16 },
 #endif
+        { NULL }
+    };
+    int rc = 0;
+    size_t i;
+
+    for(i = 0; cases[i].name; i++)
+        rc |= cipher_slot_loop(&cases[i]);
 #ifdef LIBSSH2_MBEDTLS
     rc |= check_cipher_edges();
 #endif
@@ -1117,14 +1147,36 @@ static int test_cipher_slots(void)
 }
 
 #if LIBSSH2_AES_CTR || LIBSSH2_AES_CBC || LIBSSH2_3DES
+/* The transport hands the cipher one block per call; only mbedTLS is
+   asked to cope with several blocks at once. */
+static int crypt_chunk(ssh2_cipher_ctx *c, SSH2_CIPHER_T(algo), int encrypt,
+                       unsigned char *buf, size_t len, size_t bs)
+{
+#ifdef LIBSSH2_MBEDTLS
+    (void)bs;
+    return ssh2_cipher_crypt(c, algo, encrypt, buf, len, MIDDLE_BLOCK);
+#else
+    size_t off;
+
+    for(off = 0; off < len; off += bs) {
+        if(ssh2_cipher_crypt(c, algo, encrypt, buf + off, bs, MIDDLE_BLOCK))
+            return -1;
+    }
+    return 0;
+#endif
+}
+
 /* Random key and IV, four chunks of different multiples of the block
    size, in place; a second context decrypts chunk by chunk. */
-static int cipher_roundtrip(const char *name, SSH2_CIPHER_T(algo),
-                            size_t keylen, size_t ivlen, size_t bs)
+static int cipher_roundtrip(const struct cipher_case *cc)
 {
+    const char *name = cc->name;
+    SSH2_CIPHER_T(algo) = cc->algo;
+    size_t keylen = cc->keylen, ivlen = cc->ivlen, bs = cc->bs;
     unsigned char key[32], iv[16], plain[512], buf[512];
     const size_t mult[4] = { 1, 3, 2, 5 };
-    ssh2_cipher_ctx enc, dec;
+    ssh2_cipher_ctx enc;
+    ssh2_cipher_ctx dec;
     size_t i, off, total = 0;
     int have_enc = 0, have_dec = 0, rc = 1;
 
@@ -1143,9 +1195,9 @@ static int cipher_roundtrip(const char *name, SSH2_CIPHER_T(algo),
         FAIL(name);
     have_dec = 1;
 
-    for(i = 0, off = 0; i < 4; i++) {
-        if(ssh2_cipher_crypt(&enc, algo, 1, buf + off, mult[i] * bs,
-                             MIDDLE_BLOCK))
+    off = 0;
+    for(i = 0; i < 4; i++) {
+        if(crypt_chunk(&enc, algo, 1, buf + off, mult[i] * bs, bs))
             FAIL(name);
         off += mult[i] * bs;
     }
@@ -1153,9 +1205,9 @@ static int cipher_roundtrip(const char *name, SSH2_CIPHER_T(algo),
 
     /* a flipped ciphertext byte must not decrypt to the original */
     buf[total / 2] ^= 0x01;
-    for(i = 0, off = 0; i < 4; i++) {
-        if(ssh2_cipher_crypt(&dec, algo, 0, buf + off, mult[i] * bs,
-                             MIDDLE_BLOCK))
+    off = 0;
+    for(i = 0; i < 4; i++) {
+        if(crypt_chunk(&dec, algo, 0, buf + off, mult[i] * bs, bs))
             FAIL(name);
         off += mult[i] * bs;
     }
@@ -1173,15 +1225,15 @@ static int cipher_roundtrip(const char *name, SSH2_CIPHER_T(algo),
     if(ssh2_cipher_init(&dec, algo, iv, key, 0))
         FAIL(name);
     have_dec = 1;
-    for(i = 0, off = 0; i < 4; i++) {
-        if(ssh2_cipher_crypt(&enc, algo, 1, buf + off, mult[i] * bs,
-                             MIDDLE_BLOCK))
+    off = 0;
+    for(i = 0; i < 4; i++) {
+        if(crypt_chunk(&enc, algo, 1, buf + off, mult[i] * bs, bs))
             FAIL(name);
         off += mult[i] * bs;
     }
-    for(i = 0, off = 0; i < 4; i++) {
-        if(ssh2_cipher_crypt(&dec, algo, 0, buf + off, mult[i] * bs,
-                             MIDDLE_BLOCK))
+    off = 0;
+    for(i = 0; i < 4; i++) {
+        if(crypt_chunk(&dec, algo, 0, buf + off, mult[i] * bs, bs))
             FAIL(name);
         off += mult[i] * bs;
     }
@@ -1198,23 +1250,30 @@ fail:
 
 static int test_cipher_roundtrips(void)
 {
-    int rc = 0;
+    static const struct cipher_case cases[] = {
 #if LIBSSH2_AES_CTR
-    rc |= cipher_roundtrip("aes128-ctr", ssh2_cipher_aes128ctr, 16, 16, 16);
-    rc |= cipher_roundtrip("aes192-ctr", ssh2_cipher_aes192ctr, 24, 16, 16);
-    rc |= cipher_roundtrip("aes256-ctr", ssh2_cipher_aes256ctr, 32, 16, 16);
+        { "aes128-ctr", ssh2_cipher_aes128ctr, 16, 16, 16 },
+        { "aes192-ctr", ssh2_cipher_aes192ctr, 24, 16, 16 },
+        { "aes256-ctr", ssh2_cipher_aes256ctr, 32, 16, 16 },
 #endif
 #if LIBSSH2_AES_CBC
-    rc |= cipher_roundtrip("aes128-cbc", ssh2_cipher_aes128, 16, 16, 16);
-    rc |= cipher_roundtrip("aes192-cbc", ssh2_cipher_aes192, 24, 16, 16);
-    rc |= cipher_roundtrip("aes256-cbc", ssh2_cipher_aes256, 32, 16, 16);
+        { "aes128-cbc", ssh2_cipher_aes128, 16, 16, 16 },
+        { "aes192-cbc", ssh2_cipher_aes192, 24, 16, 16 },
+        { "aes256-cbc", ssh2_cipher_aes256, 32, 16, 16 },
 #endif
 #if LIBSSH2_3DES
-    /* LIBSSH2_3DES is forced to 0 unless LIBSSH2_3DES_ENABLE is defined
-       (for example -DLIBSSH2_3DES_ENABLE=ON with CMake), so this case
-       only runs in builds that opt in. */
-    rc |= cipher_roundtrip("3des-cbc", ssh2_cipher_3des, 24, 8, 8);
+        /* LIBSSH2_3DES is forced to 0 unless LIBSSH2_3DES_ENABLE is
+           defined (for example -DLIBSSH2_3DES_ENABLE=ON with CMake), so
+           this case only runs in builds that opt in. */
+        { "3des-cbc", ssh2_cipher_3des, 24, 8, 8 },
 #endif
+        { NULL }
+    };
+    int rc = 0;
+    size_t i;
+
+    for(i = 0; cases[i].name; i++)
+        rc |= cipher_roundtrip(&cases[i]);
     return rc;
 }
 #endif
@@ -1321,14 +1380,19 @@ static int gcm_reference(const unsigned char *key, size_t keylen,
 }
 #endif
 
-static int gcm_case(const char *name, SSH2_CIPHER_T(algo), size_t keylen)
+static int gcm_case(const struct cipher_case *cc)
 {
+    const char *name = cc->name;
+    SSH2_CIPHER_T(algo) = cc->algo;
+    size_t keylen = cc->keylen;
     static const size_t blocks[2] = { 2, 5 };
     unsigned char key[32], iv[12];
     unsigned char plain[2][4 + 16 * 5 + GCM_TAG];
     unsigned char wire[2][4 + 16 * 5 + GCM_TAG];
     unsigned char bad[4 + 16 * 5 + GCM_TAG];
-    ssh2_cipher_ctx enc, enc2, dec;
+    ssh2_cipher_ctx enc;
+    ssh2_cipher_ctx enc2;
+    ssh2_cipher_ctx dec;
     size_t L[2], i;
     int have_enc = 0, have_enc2 = 0, have_dec = 0, rc = 1;
 
@@ -1492,9 +1556,16 @@ fail:
 
 static int test_aes_gcm(void)
 {
+    static const struct cipher_case cases[] = {
+        { "aes128-gcm", ssh2_cipher_aes128gcm, 16, 12, 16 },
+        { "aes256-gcm", ssh2_cipher_aes256gcm, 32, 12, 16 },
+        { NULL }
+    };
     int rc = 0;
-    rc |= gcm_case("aes128-gcm", ssh2_cipher_aes128gcm, 16);
-    rc |= gcm_case("aes256-gcm", ssh2_cipher_aes256gcm, 32);
+    size_t i;
+
+    for(i = 0; cases[i].name; i++)
+        rc |= gcm_case(&cases[i]);
     return rc;
 }
 #endif
