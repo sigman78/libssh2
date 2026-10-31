@@ -40,28 +40,21 @@
 #if MBEDTLS_VERSION_NUMBER < 0x03010000
 #  error "mbedTLS 3.1.0 or greater required"
 #endif
-#if !defined(MBEDTLS_ECDH_C) || \
-    !defined(MBEDTLS_ECDSA_C) || \
-    !defined(MBEDTLS_ECP_DP_SECP256R1_ENABLED) || \
-    !defined(MBEDTLS_ECP_DP_SECP384R1_ENABLED) || \
-    !defined(MBEDTLS_ECP_DP_SECP521R1_ENABLED)
-#  error "ECDH/ECDSA with nistp256, nistp384, nistp521 curves is required"
-#endif
-
 #include <mbedtls/platform.h>
 #include <psa/crypto_config.h>
 #include <psa/crypto.h>
+#if !(defined(PSA_WANT_ALG_ECDSA) && PSA_WANT_ALG_ECDSA && \
+      defined(PSA_WANT_ALG_ECDH) && PSA_WANT_ALG_ECDH && \
+      defined(PSA_WANT_ECC_SECP_R1_256) && PSA_WANT_ECC_SECP_R1_256 && \
+      defined(PSA_WANT_ECC_SECP_R1_384) && PSA_WANT_ECC_SECP_R1_384 && \
+      defined(PSA_WANT_ECC_SECP_R1_521) && PSA_WANT_ECC_SECP_R1_521)
+#  error "ECDH/ECDSA with nistp256, nistp384, nistp521 curves is required"
+#endif
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
 #include <mbedtls/bignum.h>
 #include <mbedtls/cipher.h>
 #ifdef MBEDTLS_GCM_C
 # include <mbedtls/gcm.h>
-#endif
-#ifdef MBEDTLS_ECDH_C
-# include <mbedtls/ecdh.h>
-#endif
-#ifdef MBEDTLS_ECDSA_C
-# include <mbedtls/ecdsa.h>
 #endif
 #include <mbedtls/psa_util.h>  /* mbedtls_psa_get_random() */
 #endif
@@ -105,7 +98,15 @@
 #define LIBSSH2_RSA_SHA1 1
 #define LIBSSH2_RSA_SHA2 1
 #define LIBSSH2_DSA 0
+#if defined(PSA_WANT_ALG_ECDSA) && PSA_WANT_ALG_ECDSA && \
+    defined(PSA_WANT_ALG_ECDH) && PSA_WANT_ALG_ECDH && \
+    defined(PSA_WANT_ECC_SECP_R1_256) && PSA_WANT_ECC_SECP_R1_256 && \
+    defined(PSA_WANT_ECC_SECP_R1_384) && PSA_WANT_ECC_SECP_R1_384 && \
+    defined(PSA_WANT_ECC_SECP_R1_521) && PSA_WANT_ECC_SECP_R1_521
 #define LIBSSH2_ECDSA 1
+#else
+#define LIBSSH2_ECDSA 0
+#endif
 #define LIBSSH2_ED25519 0
 #define LIBSSH2_MLKEM 0
 
@@ -163,13 +164,15 @@ struct mbed_hash_ctx {
 
 #if LIBSSH2_ECDSA
 typedef enum {
-    SSH2_EC_CURVE_NISTP256 = MBEDTLS_ECP_DP_SECP256R1,
-    SSH2_EC_CURVE_NISTP384 = MBEDTLS_ECP_DP_SECP384R1,
-    SSH2_EC_CURVE_NISTP521 = MBEDTLS_ECP_DP_SECP521R1
+    /* the value is the PSA key size in bits */
+    SSH2_EC_CURVE_NISTP256 = 256,
+    SSH2_EC_CURVE_NISTP384 = 384,
+    SSH2_EC_CURVE_NISTP521 = 521
 } ssh2_curve_type;
 
-#define ssh2_ecdsa_ctx         mbedtls_ecdsa_context
-#define ssh2_ec_key            mbedtls_ecp_keypair
+/* Keys live in the PSA key store; a context is a heap-held key id. */
+#define ssh2_ecdsa_ctx         psa_key_id_t
+#define ssh2_ec_key            psa_key_id_t
 #endif /* LIBSSH2_ECDSA */
 
 /*******************************************************************/
