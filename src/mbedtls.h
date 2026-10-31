@@ -115,7 +115,8 @@
 #define LIBSSH2_RSA_SHA2 1
 #define LIBSSH2_DSA 0
 #define LIBSSH2_ECDSA 1  /* guaranteed by the #error above */
-#define LIBSSH2_ED25519 0
+/* Monocypher provides ED25519 and X25519, independent of Mbed TLS */
+#define LIBSSH2_ED25519 1
 #define LIBSSH2_MLKEM 0
 
 #include "crypto_config.h"
@@ -182,6 +183,20 @@ typedef enum {
 #define ssh2_ecdsa_ctx         psa_key_id_t
 #define ssh2_ec_key            psa_key_id_t
 #endif /* LIBSSH2_ECDSA */
+
+/*******************************************************************/
+/*
+ * mbedTLS backend: ED25519 structures
+ */
+
+#if LIBSSH2_ED25519
+struct mbed_ed25519_ctx {
+    uint8_t public_key[32];
+    uint8_t private_key[64];  /* seed || public key, valid if has_private */
+    int has_private;
+};
+#define ssh2_ed25519_ctx       struct mbed_ed25519_ctx
+#endif /* LIBSSH2_ED25519 */
 
 /*******************************************************************/
 /*

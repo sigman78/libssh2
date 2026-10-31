@@ -36,6 +36,11 @@
 
 #include <stdlib.h>
 
+#if LIBSSH2_ED25519
+#include "monocypher.h"
+#include "monocypher-ed25519.h"
+#endif
+
 /* All randomness comes from the PSA generator. Mbed TLS 3.x legacy
    functions that still take an RNG callback get the PSA one. */
 #if MBEDTLS_VERSION_NUMBER < 0x04000000
@@ -1097,28 +1102,21 @@ static int mbed_uint_fixed(unsigned char *dst, size_t n,
     return 0;
 }
 
-/* OpenSSH private key format, which the pk parser does not read */
-static int mbed_parse_openssh_key(psa_key_id_t *ctx,
-                                  LIBSSH2_SESSION *session,
-                                  const char *filename,
-                                  const char *data, size_t data_len,
-                                  const char *passphrase)
+/* Imports an ECDSA key from a decrypted OpenSSH envelope, positioned
+   after the key type name */
+static int mbed_import_openssh_ecdsa(psa_key_id_t *ctx,
+                                     LIBSSH2_SESSION *session,
+                                     const char *name, size_t name_len,
+                                     struct string_buf *decrypted)
 {
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
-    struct string_buf *decrypted = NULL;
-    char *name = NULL;
     unsigned char *curvebuf, *exponent, *pointbuf, *d = NULL;
-    size_t name_len, curvebuf_len, exponent_len, pointbuf_len, n = 0;
+    size_t curvebuf_len, exponent_len, pointbuf_len, n = 0;
     const char *method, *curve_name;
     ssh2_curve_type curve;
     int ret = -1;
 
-    if(ssh2_openssh_pem_parse(session, filename, data, data_len,
-                              passphrase, &decrypted))
-        goto cleanup;
-
-    if(ssh2_get_chars(decrypted, &name, &name_len) ||
-       ssh2_pem_ecdsa_curve_type_from_name(name, name_len, &curve) ||
+    if(ssh2_pem_ecdsa_curve_type_from_name(name, name_len, &curve) ||
        ssh2_get_string(decrypted, &curvebuf, &curvebuf_len) ||
        ssh2_get_string(decrypted, &pointbuf, &pointbuf_len) ||
        ssh2_get_bignum_bytes(decrypted, &exponent, &exponent_len))
@@ -1151,8 +1149,30 @@ static int mbed_parse_openssh_key(psa_key_id_t *ctx,
 cleanup:
 
     ssh2_zero_free(session, d, n);
-    if(decrypted)
-        ssh2_string_buf_free(session, decrypted);
+    return ret;
+}
+
+/* OpenSSH private key format, which the pk parser does not read */
+static int mbed_parse_openssh_key(psa_key_id_t *ctx,
+                                  LIBSSH2_SESSION *session,
+                                  const char *filename,
+                                  const char *data, size_t data_len,
+                                  const char *passphrase)
+{
+    struct string_buf *decrypted = NULL;
+    char *name;
+    size_t name_len;
+    int ret = -1;
+
+    if(ssh2_openssh_pem_parse(session, filename, data, data_len,
+                              passphrase, &decrypted))
+        return -1;
+
+    if(ssh2_get_chars(decrypted, &name, &name_len) == 0)
+        ret = mbed_import_openssh_ecdsa(ctx, session, name, name_len,
+                                        decrypted);
+
+    ssh2_string_buf_free(session, decrypted);
 
     return ret;
 }
@@ -1161,17 +1181,15 @@ cleanup:
 static int mbed_ecdsa_openssh_pub(LIBSSH2_SESSION *session, char **method,
                                   unsigned char **pubkeydata,
                                   size_t *pubkeydata_len,
-                                  const char *filename,
-                                  const char *blob, size_t blob_len,
-                                  const char *passphrase)
+                                  const char *name, size_t name_len,
+                                  struct string_buf *decrypted)
 {
     psa_key_id_t key = PSA_KEY_ID_NULL;
     const char *method_name, *curve_name;
     size_t bits;
     int ret = -1;
 
-    if(mbed_parse_openssh_key(&key, session, filename, blob, blob_len,
-                              passphrase))
+    if(mbed_import_openssh_ecdsa(&key, session, name, name_len, decrypted))
         return -1;
 
     if(mbed_key_bits(key, &bits) == 0 &&
@@ -1186,6 +1204,315 @@ static int mbed_ecdsa_openssh_pub(LIBSSH2_SESSION *session, char **method,
     return ret;
 }
 #endif /* LIBSSH2_ECDSA */
+
+#if LIBSSH2_ED25519
+
+#define MBED_ED25519_NAME "ssh-ed25519"
+#define MBED_ED25519_NAME_LEN (sizeof(MBED_ED25519_NAME) - 1)
+
+/* Builds a private key context from a seed. If pub is given, it must match
+   the public key derived from the seed. */
+static int mbed_ed25519_from_seed(ssh2_ed25519_ctx **ed_ctx,
+                                  LIBSSH2_SESSION *session,
+                                  const unsigned char *seed,
+                                  const unsigned char *pub)
+{
+    ssh2_ed25519_ctx *ctx;
+    uint8_t tmp[SSH2_ED25519_KEY_LEN];
+
+    ctx = SSH2_CALLOC(session, sizeof(*ctx));
+    if(!ctx)
+        return ssh2_err(session, LIBSSH2_ERROR_ALLOC,
+                        "Unable to allocate memory for ed25519 key");
+
+    /* the public key is derived, not trusted; this wipes the seed copy */
+    memcpy(tmp, seed, sizeof(tmp));
+    crypto_ed25519_key_pair(ctx->private_key, ctx->public_key, tmp);
+
+    if(pub && memcmp(pub, ctx->public_key, SSH2_ED25519_KEY_LEN)) {
+        ssh2_ed25519_free(ctx, session);
+        return ssh2_err(session, LIBSSH2_ERROR_PROTO,
+                        "Ed25519 public/private key mismatch");
+    }
+
+    ctx->has_private = 1;
+    *ed_ctx = ctx;
+
+    return 0;
+}
+
+/* Reads the key fields of a decrypted OpenSSH envelope, positioned after
+   the key type name: string pub[32], string seed[32] || pub[32] */
+static int mbed_ed25519_from_openssh(ssh2_ed25519_ctx **ed_ctx,
+                                     LIBSSH2_SESSION *session,
+                                     struct string_buf *decrypted)
+{
+    unsigned char *pub, *priv;
+    size_t pub_len, priv_len;
+
+    if(ssh2_get_string(decrypted, &pub, &pub_len) ||
+       pub_len != SSH2_ED25519_KEY_LEN)
+        return ssh2_err(session, LIBSSH2_ERROR_PROTO,
+                        "Wrong ed25519 public key length");
+
+    if(ssh2_get_string(decrypted, &priv, &priv_len) ||
+       priv_len != SSH2_ED25519_PRIVATE_KEY_LEN ||
+       memcmp(priv + SSH2_ED25519_KEY_LEN, pub, SSH2_ED25519_KEY_LEN))
+        return ssh2_err(session, LIBSSH2_ERROR_PROTO,
+                        "Wrong ed25519 private key");
+
+    return mbed_ed25519_from_seed(ed_ctx, session, priv, pub);
+}
+
+/* Unencrypted PKCS#8: SEQUENCE { INTEGER 0, SEQUENCE { OID 1.3.101.112 },
+   OCTET STRING { OCTET STRING seed[32] } } has one fixed 16-byte head.
+   Returns -1 without touching the session error if it is not that. */
+static int mbed_ed25519_from_pkcs8(ssh2_ed25519_ctx **ed_ctx,
+                                   LIBSSH2_SESSION *session,
+                                   const char *filename,
+                                   const char *blob, size_t blob_len)
+{
+    static const unsigned char head[] = {
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+        0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20
+    };
+    unsigned char *der = NULL;
+    size_t der_len = 0;
+    int ret = -1;
+
+    if(ssh2_pem_parse(session, "-----BEGIN PRIVATE KEY-----",
+                      "-----END PRIVATE KEY-----", filename, blob, blob_len,
+                      NULL, &der, &der_len, NULL))
+        return -1;
+
+    if(der_len == sizeof(head) + SSH2_ED25519_KEY_LEN &&
+       !memcmp(der, head, sizeof(head)))
+        ret = mbed_ed25519_from_seed(ed_ctx, session, der + sizeof(head),
+                                     NULL);
+
+    ssh2_zero_free(session, der, der_len);
+
+    return ret;
+}
+
+/* Method name and public key blob of a loaded ed25519 key */
+static int mbed_ed25519_pub(LIBSSH2_SESSION *session, char **method,
+                            unsigned char **pubkeydata,
+                            size_t *pubkeydata_len,
+                            const ssh2_ed25519_ctx *ctx)
+{
+    size_t len = 4 + MBED_ED25519_NAME_LEN + 4 + SSH2_ED25519_KEY_LEN;
+    unsigned char *key, *p;
+
+    key = p = SSH2_ALLOC(session, len);
+    if(!key)
+        return ssh2_err(session, LIBSSH2_ERROR_ALLOC,
+                        "Unable to allocate memory for ed25519 key");
+
+    ssh2_store_str(&p, MBED_ED25519_NAME, MBED_ED25519_NAME_LEN);
+    ssh2_store_str(&p, ctx->public_key, SSH2_ED25519_KEY_LEN);
+
+    *pubkeydata = key;
+    *pubkeydata_len = len;
+
+    return mbed_method_dup(session, method, MBED_ED25519_NAME,
+                           pubkeydata, pubkeydata_len);
+}
+
+int ssh2_ed25519_new_public(ssh2_ed25519_ctx **ed_ctx,
+                            LIBSSH2_SESSION *session,
+                            const unsigned char *raw_pub_key,
+                            const size_t key_len)
+{
+    ssh2_ed25519_ctx *ctx;
+
+    if(!ed_ctx)
+        return -1;
+
+    if(key_len != SSH2_ED25519_KEY_LEN)
+        return ssh2_err(session, LIBSSH2_ERROR_PROTO,
+                        "could not create ED25519 public key");
+
+    ctx = SSH2_CALLOC(session, sizeof(*ctx));
+    if(!ctx)
+        return ssh2_err(session, LIBSSH2_ERROR_ALLOC,
+                        "Unable to allocate memory for ed25519 key");
+
+    memcpy(ctx->public_key, raw_pub_key, SSH2_ED25519_KEY_LEN);
+    *ed_ctx = ctx;
+
+    return 0;
+}
+
+int ssh2_ed25519_new_priv(ssh2_ed25519_ctx **ed_ctx,
+                          LIBSSH2_SESSION *session,
+                          const char *filename,
+                          const char *blob, size_t blob_len,
+                          const char *passphrase)
+{
+    struct string_buf *decrypted = NULL;
+    int ret;
+
+    *ed_ctx = NULL;
+
+    if(mbed_ed25519_from_pkcs8(ed_ctx, session, filename, blob, blob_len) == 0)
+        return 0;
+
+    ret = ssh2_openssh_pem_parse(session, filename, blob, blob_len,
+                                 passphrase, &decrypted);
+    if(ret)
+        return ret;
+
+    if(ssh2_match_string(decrypted, MBED_ED25519_NAME))
+        ret = ssh2_err(session, LIBSSH2_ERROR_PROTO,
+                       "Private key is not an ED25519 key");
+    else
+        ret = mbed_ed25519_from_openssh(ed_ctx, session, decrypted);
+
+    ssh2_string_buf_free(session, decrypted);
+
+    return ret;
+}
+
+int ssh2_ed25519_sign(ssh2_ed25519_ctx *ed_ctx, LIBSSH2_SESSION *session,
+                      uint8_t **out_sig, size_t *out_sig_len,
+                      const uint8_t *message, size_t message_len)
+{
+    uint8_t *sig;
+
+    if(!ed_ctx || !ed_ctx->has_private)
+        return -1;
+
+    sig = SSH2_ALLOC(session, SSH2_ED25519_SIG_LEN);
+    if(!sig)
+        return -1;
+
+    crypto_ed25519_sign(sig, ed_ctx->private_key, message, message_len);
+
+    *out_sig = sig;
+    *out_sig_len = SSH2_ED25519_SIG_LEN;
+
+    return 0;
+}
+
+int ssh2_ed25519_verify(ssh2_ed25519_ctx *ed_ctx, LIBSSH2_SESSION *session,
+                        const uint8_t *s, size_t s_len,
+                        const uint8_t *m, size_t m_len)
+{
+    (void)session;
+
+    if(!ed_ctx || s_len != SSH2_ED25519_SIG_LEN)
+        return -1;
+
+    return crypto_ed25519_check(s, ed_ctx->public_key, m, m_len) ? -1 : 0;
+}
+
+void ssh2_ed25519_free(ssh2_ed25519_ctx *ed_ctx, LIBSSH2_SESSION *session)
+{
+    ssh2_zero_free(session, ed_ctx, sizeof(*ed_ctx));
+}
+
+#endif /* LIBSSH2_ED25519 */
+
+/* Public key of an OpenSSH-format private key, whatever its type. The
+   OpenSSH parser's own errors (bad passphrase, ...) reach the caller. */
+static int mbed_openssh_pub(LIBSSH2_SESSION *session, char **method,
+                            unsigned char **pubkeydata,
+                            size_t *pubkeydata_len,
+                            const char *blob, size_t blob_len,
+                            const char *passphrase)
+{
+    struct string_buf *decrypted = NULL;
+    char *name;
+    size_t name_len;
+    int ret;
+
+    ret = ssh2_openssh_pem_parse(session, NULL, blob, blob_len,
+                                 passphrase, &decrypted);
+    if(ret == -1)
+        return ssh2_err(session, LIBSSH2_ERROR_PROTO,
+                        "Unable to parse the OpenSSH key");
+    if(ret)
+        return ret;
+
+    ret = -1;
+    if(ssh2_get_chars(decrypted, &name, &name_len)) {
+        ret = ssh2_err(session, LIBSSH2_ERROR_PROTO,
+                       "Unable to read the OpenSSH key type");
+    }
+#if LIBSSH2_ED25519
+    else if(name_len == MBED_ED25519_NAME_LEN &&
+            !memcmp(name, MBED_ED25519_NAME, name_len)) {
+        ssh2_ed25519_ctx *ctx = NULL;
+
+        ret = mbed_ed25519_from_openssh(&ctx, session, decrypted);
+        if(ret == 0) {
+            ret = mbed_ed25519_pub(session, method, pubkeydata,
+                                   pubkeydata_len, ctx);
+            ssh2_ed25519_free(ctx, session);
+        }
+    }
+#endif
+#if LIBSSH2_ECDSA
+    else if(mbed_ecdsa_openssh_pub(session, method, pubkeydata,
+                                   pubkeydata_len, name, name_len,
+                                   decrypted) == 0) {
+        ret = 0;
+    }
+#endif
+
+    if(ret == -1)
+        ret = ssh2_err(session, LIBSSH2_ERROR_FILE,
+                       "OpenSSH key type not supported");
+
+    ssh2_string_buf_free(session, decrypted);
+
+    return ret;
+}
+
+static int mbed_is_openssh_key(const char *blob, size_t len)
+{
+    static const char hdr[] = "-----BEGIN OPENSSH PRIVATE KEY-----";
+
+    while(len && (*blob == ' ' || *blob == '\t' ||
+                  *blob == '\r' || *blob == '\n')) {
+        blob++;
+        len--;
+    }
+    return len >= sizeof(hdr) - 1 && !memcmp(blob, hdr, sizeof(hdr) - 1);
+}
+
+/* Formats the pk parser cannot read. Returns 1 if the input is none of
+   them, so the caller reports the pk parser's error instead. */
+static int mbed_pub_fallback(LIBSSH2_SESSION *session, char **method,
+                             unsigned char **pubkeydata,
+                             size_t *pubkeydata_len,
+                             const char *blob, size_t blob_len,
+                             const char *passphrase)
+{
+#if LIBSSH2_ED25519
+    ssh2_ed25519_ctx *ctx = NULL;
+    int ret;
+#endif
+
+    if(!blob || !blob_len)
+        return 1;
+
+    if(mbed_is_openssh_key(blob, blob_len))
+        return mbed_openssh_pub(session, method, pubkeydata, pubkeydata_len,
+                                blob, blob_len, passphrase);
+
+#if LIBSSH2_ED25519
+    if(mbed_ed25519_from_pkcs8(&ctx, session, NULL, blob, blob_len))
+        return 1;
+
+    ret = mbed_ed25519_pub(session, method, pubkeydata, pubkeydata_len, ctx);
+    ssh2_ed25519_free(ctx, session);
+    return ret;
+#else
+    return 1;
+#endif
+}
 
 static int mbed_pub_priv_key(LIBSSH2_SESSION *session, char **method,
                              unsigned char **pubkeydata,
@@ -1261,16 +1588,24 @@ int ssh2_pub_privkey(LIBSSH2_SESSION *session, char **method,
     ret = mbed_pk_parse(&pk, session, privkeyfile,
                         privkeyblob, privkeyblob_len, passphrase);
     if(ret) {
-#if LIBSSH2_ECDSA
-        if(mbed_ecdsa_openssh_pub(session, method, pubkeydata, pubkeydata_len,
-                                  privkeyfile, privkeyblob, privkeyblob_len,
-                                  passphrase) == 0) {
-            mbedtls_pk_free(&pk);
-            return 0;
-        }
-#endif
+        char *data = NULL;
+        size_t data_len = 0;
+
         mbedtls_strerror(ret, buf, sizeof(buf));
         mbedtls_pk_free(&pk);
+
+        /* the fallbacks work on a blob */
+        if(privkeyfile && ssh2_file_to_blob(session, privkeyfile,
+                                            &data, &data_len) == 0) {
+            privkeyblob = data;
+            privkeyblob_len = data_len;
+        }
+        ret = mbed_pub_fallback(session, method, pubkeydata, pubkeydata_len,
+                                privkeyblob, privkeyblob_len, passphrase);
+        ssh2_zero_free(session, data, data_len + 1);
+        if(ret != 1)
+            return ret;
+
         return ssh2_err_flags(session, LIBSSH2_ERROR_FILE, buf,
                               SSH2_ERR_FLAG_DUP);
     }
@@ -1630,5 +1965,62 @@ void ssh2_ecdsa_free(ssh2_ecdsa_ctx *ec_ctx, LIBSSH2_SESSION *session)
     mbed_key_free(ec_ctx, session);
 }
 #endif /* LIBSSH2_ECDSA */
+
+#if LIBSSH2_ED25519
+
+/*******************************************************************/
+/*
+ * mbedTLS backend: curve25519 key exchange (via bundled Monocypher)
+ */
+
+int ssh2_curve25519_new(LIBSSH2_SESSION *session,
+                        uint8_t **out_public_key,
+                        uint8_t **out_private_key)
+{
+    uint8_t *priv, *pub = NULL;
+
+    priv = SSH2_ALLOC(session, SSH2_ED25519_KEY_LEN);
+    if(priv)
+        pub = SSH2_ALLOC(session, SSH2_ED25519_KEY_LEN);
+
+    /* x25519 clamps the scalar itself, so raw random bytes are a key */
+    if(!priv || !pub || ssh2_random(priv, SSH2_ED25519_KEY_LEN)) {
+        ssh2_zero_free(session, priv, SSH2_ED25519_KEY_LEN);
+        SSH2_SAFEFREE(session, pub);
+        return -1;
+    }
+
+    crypto_x25519_public_key(pub, priv);
+
+    *out_private_key = priv;
+    *out_public_key = pub;
+
+    return 0;
+}
+
+int ssh2_curve25519_gen_k(ssh2_bn **k,
+                          uint8_t private_key[SSH2_ED25519_KEY_LEN],
+                          uint8_t server_public_key[SSH2_ED25519_KEY_LEN])
+{
+    static const uint8_t zero[SSH2_ED25519_KEY_LEN] = { 0 };
+    uint8_t shared[SSH2_ED25519_KEY_LEN];
+    int ret = -1;
+
+    if(!k || !*k)
+        return -1;
+
+    crypto_x25519(shared, private_key, server_public_key);
+
+    /* RFC 8731: a low-order peer key yields an all-zero secret */
+    if(crypto_verify32(shared, zero) &&
+       ssh2_bn_from_bin(k, shared, sizeof(shared)) == 0)
+        ret = 0;
+
+    crypto_wipe(shared, sizeof(shared));
+
+    return ret;
+}
+
+#endif /* LIBSSH2_ED25519 */
 
 #endif /* LIBSSH2_MBEDTLS */
