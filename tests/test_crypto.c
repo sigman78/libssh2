@@ -110,6 +110,275 @@ static int flip_byte_verify_fails(int verify_rc)
 }
 
 #if LIBSSH2_RSA
+struct rsa_parts {
+    unsigned char *n, *e, *d, *p, *q, *e1, *e2, *coeff;
+    unsigned int nlen, elen, dlen, plen, qlen, e1len, e2len, coefflen;
+};
+
+/* Splits tests/keys/id_rsa_pem into its nine PKCS#1 components; `*raw`
+   owns the memory the parts point into. */
+static int rsa_split_pem(LIBSSH2_SESSION *session, unsigned char **raw,
+                         struct rsa_parts *c)
+{
+    unsigned char *data, *ver;
+    size_t datalen;
+    unsigned int verlen;
+    int rc = 1;
+
+    *raw = NULL;
+    if(ssh2_pem_parse(session, PEM_RSA_HEADER, PEM_RSA_FOOTER,
+                      keypath("id_rsa_pem"), NULL, 0, NULL,
+                      &data, &datalen, NULL))
+        FAIL("pem parse");
+    *raw = data;
+    EXPECT(ssh2_pem_decode_sequence(&data, &datalen) == 0);
+    EXPECT(ssh2_pem_decode_integer(&data, &datalen, &ver, &verlen) == 0);
+    EXPECT(verlen == 1 && *ver == 0);
+    EXPECT(ssh2_pem_decode_integer(&data, &datalen, &c->n, &c->nlen) == 0);
+    EXPECT(ssh2_pem_decode_integer(&data, &datalen, &c->e, &c->elen) == 0);
+    EXPECT(ssh2_pem_decode_integer(&data, &datalen, &c->d, &c->dlen) == 0);
+    EXPECT(ssh2_pem_decode_integer(&data, &datalen, &c->p, &c->plen) == 0);
+    EXPECT(ssh2_pem_decode_integer(&data, &datalen, &c->q, &c->qlen) == 0);
+    EXPECT(ssh2_pem_decode_integer(&data, &datalen,
+                                   &c->e1, &c->e1len) == 0);
+    EXPECT(ssh2_pem_decode_integer(&data, &datalen,
+                                   &c->e2, &c->e2len) == 0);
+    EXPECT(ssh2_pem_decode_integer(&data, &datalen,
+                                   &c->coeff, &c->coefflen) == 0);
+    rc = 0;
+
+fail:
+    return rc;
+}
+
+static int rsa_sign_sha256(LIBSSH2_SESSION *session, ssh2_rsa_ctx *key,
+                           const unsigned char *m, size_t m_len,
+                           unsigned char **sig, size_t *sig_len)
+{
+    unsigned char hash[SSH2_SHA256_DIG_LEN];
+
+    if(!ssh2_hash(SSH2_SHA256_ALG, m, m_len, hash, sizeof(hash)))
+        return 1;
+    return ssh2_rsa_sha2_sign(key, session, hash, sizeof(hash),
+                              sig, sig_len);
+}
+
+static int rsa_verify_sha256(LIBSSH2_SESSION *session, ssh2_rsa_ctx *key,
+                             const unsigned char *sig, size_t sig_len,
+                             const unsigned char *m, size_t m_len)
+{
+    return ssh2_rsa_sha2_verify(key, session, SSH2_SHA256_DIG_LEN,
+                                sig, sig_len, m, m_len);
+}
+
+/* Full private key built from raw components, the way the OpenSSH key
+   parser does, must sign exactly like the one loaded from the file. */
+static int check_rsa_from_components(LIBSSH2_SESSION *session,
+                                     ssh2_rsa_ctx *ref_key,
+                                     ssh2_rsa_ctx *pub)
+{
+    static const unsigned char msg[] = "components";
+    struct rsa_parts c;
+    ssh2_rsa_ctx *key = NULL;
+    unsigned char *raw = NULL, *sig = NULL, *ref_sig = NULL;
+    size_t sig_len = 0, ref_len = 0;
+    int rc = 1;
+
+    if(rsa_split_pem(session, &raw, &c))
+        goto fail;
+    EXPECT(rsa_sign_sha256(session, ref_key, msg, sizeof(msg),
+                           &ref_sig, &ref_len) == 0);
+
+    EXPECT(ssh2_rsa_new(&key, session, c.e, c.elen, c.n, c.nlen,
+                        c.d, c.dlen, c.p, c.plen, c.q, c.qlen,
+                        c.e1, c.e1len, c.e2, c.e2len,
+                        c.coeff, c.coefflen) == 0);
+    EXPECT(rsa_sign_sha256(session, key, msg, sizeof(msg),
+                           &sig, &sig_len) == 0);
+    EXPECT(sig_len == ref_len && memcmp(sig, ref_sig, sig_len) == 0);
+    EXPECT(rsa_verify_sha256(session, pub, sig, sig_len,
+                             msg, sizeof(msg)) == 0);
+    rc = 0;
+
+fail:
+    SSH2_FREE(session, sig);
+    SSH2_FREE(session, ref_sig);
+    ssh2_rsa_free(key, session);
+    SSH2_FREE(session, raw);
+    return rc;
+}
+
+/* Verifies with a key built the way src/hostkey.c does: e and n straight
+   off the wire as SSH strings, sign byte included. */
+static int check_rsa_hostkey_blob(LIBSSH2_SESSION *session,
+                                  const unsigned char *blob, size_t blob_len,
+                                  ssh2_rsa_ctx *priv)
+{
+    static const unsigned char msg[] = "hostkey";
+    struct string_buf buf;
+    unsigned char *name, *e, *n, *sig = NULL;
+    size_t name_len, e_len, n_len, sig_len = 0;
+    ssh2_rsa_ctx *pub = NULL;
+    int rc = 1;
+
+    buf.data = buf.dataptr = (unsigned char *)blob;
+    buf.len = blob_len;
+    EXPECT(ssh2_get_string(&buf, &name, &name_len) == 0);
+    EXPECT(ssh2_get_string(&buf, &e, &e_len) == 0);
+    EXPECT(ssh2_get_string(&buf, &n, &n_len) == 0);
+    EXPECT(n_len > 0 && n[0] == 0);  /* sign byte present */
+    EXPECT(ssh2_rsa_new(&pub, session, e, e_len, n, n_len,
+                        NULL, 0, NULL, 0, NULL, 0,
+                        NULL, 0, NULL, 0, NULL, 0) == 0);
+    EXPECT(rsa_sign_sha256(session, priv, msg, sizeof(msg),
+                           &sig, &sig_len) == 0);
+    EXPECT(rsa_verify_sha256(session, pub, sig, sig_len,
+                             msg, sizeof(msg)) == 0);
+    rc = 0;
+
+fail:
+    SSH2_FREE(session, sig);
+    ssh2_rsa_free(pub, session);
+    return rc;
+}
+
+/* Signatures that start with a zero byte: peers strip it or pad it */
+static int check_rsa_leading_zero(LIBSSH2_SESSION *session,
+                                  ssh2_rsa_ctx *priv, ssh2_rsa_ctx *pub)
+{
+    unsigned char *sig = NULL, *alt = NULL;
+    size_t sig_len = 0;
+    char msg[16];
+    int i, rc = 1;
+
+    for(i = 0; i < 2000; i++) {
+        snprintf(msg, sizeof(msg), "m%d", i);
+        EXPECT(rsa_sign_sha256(session, priv, (unsigned char *)msg,
+                               strlen(msg), &sig, &sig_len) == 0);
+        if(sig[0] == 0)
+            break;
+        SSH2_SAFEFREE(session, sig);
+    }
+    EXPECT(sig);  /* found a message with sig[0] == 0 */
+    fprintf(stderr, "leading-zero signature at m%d\n", i);
+
+    EXPECT(rsa_verify_sha256(session, pub, sig, sig_len,
+                             (unsigned char *)msg, strlen(msg)) == 0);
+    EXPECT(rsa_verify_sha256(session, pub, sig + 1, sig_len - 1,
+                             (unsigned char *)msg, strlen(msg)) == 0);
+
+    alt = SSH2_CALLOC(session, sig_len + 1);
+    EXPECT(alt);
+    memcpy(alt + 1, sig, sig_len);
+    EXPECT(rsa_verify_sha256(session, pub, alt, sig_len + 1,
+                             (unsigned char *)msg, strlen(msg)) == 0);
+    alt[0] = 1;
+    EXPECT(rsa_verify_sha256(session, pub, alt, sig_len + 1,
+                             (unsigned char *)msg, strlen(msg)) != 0);
+    rc = 0;
+
+fail:
+    SSH2_FREE(session, sig);
+    SSH2_FREE(session, alt);
+    return rc;
+}
+
+/* Error paths must not leak PSA key slots (32 volatile ones by default) */
+static int check_rsa_slot_hygiene(LIBSSH2_SESSION *session)
+{
+    static const unsigned char tiny_n[] = { 0x05 }, tiny_e[] = { 0x03 };
+    ssh2_rsa_ctx *key = NULL;
+    char *method = NULL;
+    unsigned char *pubkey = NULL;
+    size_t pubkey_len = 0;
+    int i, rc = 1;
+
+    for(i = 0; i < 48; i++) {
+        EXPECT(ssh2_rsa_new_priv(&key, session, keypath("id_rsa_pem"),
+                                 NULL, 0, NULL) == 0);
+        ssh2_rsa_free(key, session);
+        key = NULL;
+
+        EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                                keypath("id_rsa_pem"), NULL, 0, NULL) == 0);
+        SSH2_SAFEFREE(session, method);
+        SSH2_SAFEFREE(session, pubkey);
+
+        EXPECT(ssh2_rsa_new(&key, session, tiny_e, 1, tiny_n, 1,
+                            NULL, 0, NULL, 0, NULL, 0,
+                            NULL, 0, NULL, 0, NULL, 0) != 0);
+        EXPECT(!key);
+
+        EXPECT(ssh2_rsa_new_priv(&key, session,
+                                 keypath("id_rsa_pem_encrypted"),
+                                 NULL, 0, "wrong") != 0);
+        EXPECT(!key);
+        EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                                keypath("id_rsa_pem_encrypted"),
+                                NULL, 0, "wrong") != 0);
+    }
+
+    EXPECT(ssh2_rsa_new_priv(&key, session, keypath("id_rsa_pem"),
+                             NULL, 0, NULL) == 0);
+    rc = 0;
+
+fail:
+    ssh2_rsa_free(key, session);
+    SSH2_FREE(session, method);
+    SSH2_FREE(session, pubkey);
+    return rc;
+}
+
+static int check_rsa_edges(LIBSSH2_SESSION *session,
+                           const unsigned char *blob, size_t blob_len,
+                           ssh2_rsa_ctx *priv, ssh2_rsa_ctx *pub)
+{
+    static const unsigned char msg[] = "tamper";
+    unsigned char *sig = NULL;
+    size_t sig_len = 0;
+    ssh2_rsa_ctx *wrong = NULL;
+    char *method = NULL;
+    unsigned char *pubkey = NULL;
+    size_t pubkey_len = 0;
+    int rc = 1;
+
+    if(check_rsa_from_components(session, priv, pub) ||
+       check_rsa_hostkey_blob(session, blob, blob_len, priv) ||
+       check_rsa_leading_zero(session, priv, pub))
+        goto fail;
+
+    /* one flipped byte in the middle of the signature */
+    EXPECT(rsa_sign_sha256(session, priv, msg, sizeof(msg),
+                           &sig, &sig_len) == 0);
+    EXPECT(rsa_verify_sha256(session, pub, sig, sig_len,
+                             msg, sizeof(msg)) == 0);
+    sig[sig_len / 2] ^= 0x40;
+    EXPECT(rsa_verify_sha256(session, pub, sig, sig_len,
+                             msg, sizeof(msg)) != 0);
+
+    /* an ECDSA key is not an RSA key */
+    EXPECT(ssh2_rsa_new_priv(&wrong, session, keypath("id_ecdsa_pem"),
+                             NULL, 0, NULL) != 0);
+    EXPECT(!wrong);
+
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            keypath("id_rsa_pem_encrypted"), NULL, 0,
+                            "wrong") != 0);
+
+    if(check_rsa_slot_hygiene(session))
+        goto fail;
+    rc = 0;
+
+fail:
+    SSH2_FREE(session, sig);
+    SSH2_FREE(session, method);
+    SSH2_FREE(session, pubkey);
+    return rc;
+}
+
+/* RSA-SHA1 is compiled out unless LIBSSH2_RSA_SHA1_ENABLE is defined;
+   the SHA-1 entry points are not covered here. */
+
 static int test_rsa(LIBSSH2_SESSION *session)
 {
     static const struct {
@@ -215,6 +484,9 @@ static int test_rsa(LIBSSH2_SESSION *session)
                                     sig, sig_len, msg, sizeof(msg)) != 0);
         SSH2_SAFEFREE(session, sig);
     }
+
+    if(check_rsa_edges(session, blob, blob_len, priv, pub))
+        goto fail;
 
     rc = 0;
 
