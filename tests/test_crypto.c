@@ -885,6 +885,323 @@ fail:
 }
 #endif /* LIBSSH2_ECDSA */
 
+#if LIBSSH2_ED25519
+static int hex_digit(char c)
+{
+    if(c >= '0' && c <= '9')
+        return c - '0';
+    if(c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int hex_decode(const char *hex, unsigned char *out, size_t n)
+{
+    size_t i;
+
+    if(strlen(hex) != 2 * n)
+        return 1;
+    for(i = 0; i < n; i++) {
+        int hi = hex_digit(hex[2 * i]);
+        int lo = hex_digit(hex[2 * i + 1]);
+
+        if(hi < 0 || lo < 0)
+            return 1;
+        out[i] = (unsigned char)(hi << 4 | lo);
+    }
+    return 0;
+}
+
+/* RFC 8032 section 7.1: a public key, a message and its signature */
+static int check_ed25519_vector(LIBSSH2_SESSION *session, const char *pk_hex,
+                                const char *msg_hex, size_t msg_len,
+                                const char *sig_hex)
+{
+    unsigned char pk[SSH2_ED25519_KEY_LEN], msg[1], sig[SSH2_ED25519_SIG_LEN];
+    ssh2_ed25519_ctx *pub = NULL;
+    int rc = 1;
+
+    EXPECT(msg_len <= sizeof(msg));
+    EXPECT(hex_decode(pk_hex, pk, sizeof(pk)) == 0);
+    EXPECT(hex_decode(msg_hex, msg, msg_len) == 0);
+    EXPECT(hex_decode(sig_hex, sig, sizeof(sig)) == 0);
+
+    EXPECT(ssh2_ed25519_new_public(&pub, session, pk, sizeof(pk)) == 0);
+    EXPECT(ssh2_ed25519_verify(pub, session, sig, sizeof(sig),
+                               msg, msg_len) == 0);
+    sig[10] ^= 1;
+    EXPECT(ssh2_ed25519_verify(pub, session, sig, sizeof(sig),
+                               msg, msg_len) != 0);
+
+    rc = 0;
+
+fail:
+    ssh2_ed25519_free(pub, session);
+    return rc;
+}
+
+/* An OpenSSH-made certificate (id_ed25519_openssh_signed-cert.pub, signed
+   by ca_user_ed25519): the signature covers all but the last string. */
+static int check_ed25519_cert(LIBSSH2_SESSION *session)
+{
+    unsigned char *cert = NULL, *ca = NULL;
+    unsigned char *str, *sig, *sigdata, *alg, *capk;
+    size_t cert_len = 0, ca_len = 0, str_len, sig_len, sigdata_len;
+    size_t alg_len, capk_len, signed_len, i;
+    struct string_buf buf, sbuf;
+    ssh2_ed25519_ctx *ca_key = NULL;
+    libssh2_uint64_t u64;
+    uint32_t u32;
+    int rc = 1;
+
+    EXPECT(read_pub_blob(session, "id_ed25519_openssh_signed-cert",
+                         &cert, &cert_len) == 0);
+    buf.data = buf.dataptr = cert;
+    buf.len = cert_len;
+
+    EXPECT(ssh2_get_string(&buf, &str, &str_len) == 0);
+    EXPECT(str_len == 32 &&
+           memcmp(str, "ssh-ed25519-cert-v01@openssh.com", 32) == 0);
+    /* nonce, public key */
+    for(i = 0; i < 2; i++)
+        EXPECT(ssh2_get_string(&buf, &str, &str_len) == 0);
+    EXPECT(ssh2_get_u64(&buf, &u64) == 0);  /* serial */
+    EXPECT(ssh2_get_u32(&buf, &u32) == 0);  /* type */
+    /* key id, principals */
+    for(i = 0; i < 2; i++)
+        EXPECT(ssh2_get_string(&buf, &str, &str_len) == 0);
+    EXPECT(ssh2_get_u64(&buf, &u64) == 0);  /* valid after */
+    EXPECT(ssh2_get_u64(&buf, &u64) == 0);  /* valid before */
+    /* critical options, extensions, reserved, signature key */
+    for(i = 0; i < 4; i++)
+        EXPECT(ssh2_get_string(&buf, &str, &str_len) == 0);
+
+    signed_len = (size_t)(buf.dataptr - buf.data);
+    EXPECT(ssh2_get_string(&buf, &sig, &sig_len) == 0);
+    EXPECT(buf.dataptr == buf.data + buf.len);
+
+    sbuf.data = sbuf.dataptr = sig;
+    sbuf.len = sig_len;
+    EXPECT(ssh2_get_string(&sbuf, &alg, &alg_len) == 0);
+    EXPECT(alg_len == 11 && memcmp(alg, "ssh-ed25519", 11) == 0);
+    EXPECT(ssh2_get_string(&sbuf, &sigdata, &sigdata_len) == 0);
+    EXPECT(sbuf.dataptr == sbuf.data + sbuf.len);
+    EXPECT(sigdata_len == SSH2_ED25519_SIG_LEN);
+
+    EXPECT(read_pub_blob(session, "ca_user_ed25519", &ca, &ca_len) == 0);
+    sbuf.data = sbuf.dataptr = ca;
+    sbuf.len = ca_len;
+    EXPECT(ssh2_get_string(&sbuf, &alg, &alg_len) == 0);
+    EXPECT(ssh2_get_string(&sbuf, &capk, &capk_len) == 0);
+    EXPECT(ssh2_ed25519_new_public(&ca_key, session, capk, capk_len) == 0);
+
+    EXPECT(ssh2_ed25519_verify(ca_key, session, sigdata, sigdata_len,
+                               cert, signed_len) == 0);
+    EXPECT(ssh2_ed25519_verify(ca_key, session, sigdata, sigdata_len,
+                               cert, signed_len - 1) != 0);
+
+    rc = 0;
+
+fail:
+    ssh2_ed25519_free(ca_key, session);
+    SSH2_FREE(session, cert);
+    SSH2_FREE(session, ca);
+    return rc;
+}
+
+/* Both parties derive the same K; low-order peer keys give no K */
+static int check_curve25519(LIBSSH2_SESSION *session)
+{
+    uint8_t *pub_a = NULL, *priv_a = NULL, *pub_b = NULL, *priv_b = NULL;
+    uint8_t zero[SSH2_ED25519_KEY_LEN], one[SSH2_ED25519_KEY_LEN];
+    unsigned char ka[SSH2_ED25519_KEY_LEN], kb[SSH2_ED25519_KEY_LEN];
+    ssh2_bn *k_a = NULL, *k_b = NULL;
+    size_t n;
+    int rc = 1;
+
+    memset(zero, 0, sizeof(zero));
+    memset(one, 0, sizeof(one));
+    one[0] = 1;
+
+    EXPECT(ssh2_curve25519_new(session, &pub_a, &priv_a) == 0);
+    EXPECT(ssh2_curve25519_new(session, &pub_b, &priv_b) == 0);
+    EXPECT(pub_a && priv_a && pub_b && priv_b);
+    EXPECT(memcmp(pub_a, zero, sizeof(zero)) != 0);
+    EXPECT(memcmp(pub_a, pub_b, sizeof(zero)) != 0);
+    EXPECT(memcmp(priv_a, priv_b, sizeof(zero)) != 0);
+
+    k_a = ssh2_bn_init();
+    k_b = ssh2_bn_init();
+    EXPECT(k_a && k_b);
+    EXPECT(ssh2_curve25519_gen_k(&k_a, priv_a, pub_b) == 0);
+    EXPECT(ssh2_curve25519_gen_k(&k_b, priv_b, pub_a) == 0);
+
+    n = ssh2_bn_bytes(k_a);
+    EXPECT(n > 0 && n <= sizeof(ka));
+    EXPECT(ssh2_bn_bytes(k_b) == n);
+    ssh2_bn_to_bin(k_a, ka);
+    ssh2_bn_to_bin(k_b, kb);
+    EXPECT(memcmp(ka, kb, n) == 0);
+
+    /* RFC 8731: an all-zero shared secret must be refused */
+    EXPECT(ssh2_curve25519_gen_k(&k_a, priv_a, zero) != 0);
+    EXPECT(ssh2_curve25519_gen_k(&k_a, priv_a, one) != 0);
+
+    rc = 0;
+
+fail:
+    ssh2_bn_free(k_a);
+    ssh2_bn_free(k_b);
+    ssh2_zero_free(session, priv_a, SSH2_ED25519_KEY_LEN);
+    ssh2_zero_free(session, priv_b, SSH2_ED25519_KEY_LEN);
+    SSH2_FREE(session, pub_a);
+    SSH2_FREE(session, pub_b);
+    return rc;
+}
+
+static int test_ed25519(LIBSSH2_SESSION *session)
+{
+    /* id_ed25519_pkcs8_encrypted is left out: encrypted PKCS#8 */
+    static const struct {
+        const char *name;
+        const char *passphrase;
+    } keys[] = {
+        { "id_ed25519_openssh", NULL },
+        { "id_ed25519_openssh_encrypted", "libssh2" },
+        { "id_ed25519_pkcs8", NULL },
+        { "ca_user_ed25519", NULL },
+        { "ca_host_ed25519", NULL }
+    };
+    const unsigned char msg[] = "the quick brown fox";
+    unsigned char tampered[sizeof(msg)];
+    ssh2_ed25519_ctx *priv = NULL, *pub = NULL, *bad = NULL;
+    unsigned char *blob = NULL, *sig = NULL, *name, *raw;
+    char *data = NULL;
+    size_t blob_len = 0, sig_len = 0, name_len, raw_len, data_len = 0, i;
+    char *method = NULL;
+    unsigned char *pubkey = NULL;
+    size_t pubkey_len = 0;
+    struct string_buf buf;
+    int rc = 1;
+
+    for(i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        /* public key derivation, from file and from memory */
+        if(check_pub_privkey(session, keys[i].name, keys[i].passphrase,
+                             "ssh-ed25519", &blob, &blob_len))
+            goto fail;
+
+        /* private key loading, file and memory */
+        if(ssh2_ed25519_new_priv(&priv, session, keypath(keys[i].name),
+                                 NULL, 0, keys[i].passphrase))
+            FAIL(keys[i].name);
+        EXPECT(priv);
+        ssh2_ed25519_free(priv, session);
+        priv = NULL;
+
+        EXPECT(ssh2_file_to_blob(session, keypath(keys[i].name),
+                                 &data, &data_len) == 0);
+        if(ssh2_ed25519_new_priv(&priv, session, NULL, data, data_len,
+                                 keys[i].passphrase))
+            FAIL(keys[i].name);
+        EXPECT(priv);
+        ssh2_zero_free(session, data, data_len + 1);
+        data = NULL;
+
+        /* public key from the wire blob: method || key */
+        buf.data = buf.dataptr = blob;
+        buf.len = blob_len;
+        EXPECT(ssh2_get_string(&buf, &name, &name_len) == 0);
+        EXPECT(name_len == 11 && memcmp(name, "ssh-ed25519", 11) == 0);
+        EXPECT(ssh2_get_string(&buf, &raw, &raw_len) == 0);
+        EXPECT(buf.dataptr == buf.data + buf.len);
+        EXPECT(raw_len == SSH2_ED25519_KEY_LEN);
+        EXPECT(ssh2_ed25519_new_public(&pub, session, raw, raw_len) == 0);
+
+        /* a wrong length must be refused */
+        EXPECT(ssh2_ed25519_new_public(&bad, session,
+                                       raw, raw_len - 1) != 0);
+        EXPECT(!bad);
+
+        EXPECT(ssh2_ed25519_sign(priv, session, &sig, &sig_len,
+                                 msg, sizeof(msg)) == 0);
+        EXPECT(sig_len == SSH2_ED25519_SIG_LEN);
+        EXPECT(ssh2_ed25519_verify(pub, session, sig, sig_len,
+                                   msg, sizeof(msg)) == 0);
+        EXPECT(ssh2_ed25519_verify(priv, session, sig, sig_len,
+                                   msg, sizeof(msg)) == 0);
+
+        memcpy(tampered, msg, sizeof(msg));
+        tampered[3] ^= 1;
+        EXPECT(ssh2_ed25519_verify(pub, session, sig, sig_len,
+                                   tampered, sizeof(tampered)) != 0);
+        sig[7] ^= 1;
+        EXPECT(ssh2_ed25519_verify(pub, session, sig, sig_len,
+                                   msg, sizeof(msg)) != 0);
+        sig[7] ^= 1;
+        EXPECT(ssh2_ed25519_verify(pub, session, sig, sig_len - 1,
+                                   msg, sizeof(msg)) != 0);
+
+        SSH2_SAFEFREE(session, sig);
+        SSH2_SAFEFREE(session, blob);
+        ssh2_ed25519_free(priv, session);
+        ssh2_ed25519_free(pub, session);
+        priv = pub = NULL;
+    }
+
+    /* wrong passphrase must fail and leave no context */
+    EXPECT(ssh2_ed25519_new_priv(&priv, session,
+                                 keypath("id_ed25519_openssh_encrypted"),
+                                 NULL, 0, "wrong") != 0);
+    EXPECT(!priv);
+    EXPECT(ssh2_pub_privkey(session, &method, &pubkey, &pubkey_len,
+                            keypath("id_ed25519_openssh_encrypted"),
+                            NULL, 0, "wrong") != 0);
+    EXPECT(!method && !pubkey);
+
+    /* so must a key of another type */
+    EXPECT(ssh2_ed25519_new_priv(&priv, session, keypath("ca_user_ecdsa"),
+                                 NULL, 0, NULL) != 0);
+    EXPECT(!priv);
+
+    /* RFC 8032 test vectors 1 and 2 */
+    if(check_ed25519_vector(
+           session,
+           "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+           "", 0,
+           "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+           "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"))
+        goto fail;
+    if(check_ed25519_vector(
+           session,
+           "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+           "72", 1,
+           "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+           "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"))
+        goto fail;
+
+    if(check_ed25519_cert(session))
+        goto fail;
+
+    if(check_curve25519(session))
+        goto fail;
+
+    if(check_no_key_slots())
+        goto fail;
+
+    rc = 0;
+
+fail:
+    SSH2_FREE(session, sig);
+    SSH2_FREE(session, method);
+    SSH2_FREE(session, pubkey);
+    ssh2_ed25519_free(priv, session);
+    ssh2_ed25519_free(pub, session);
+    ssh2_zero_free(session, data, data_len + 1);
+    SSH2_FREE(session, blob);
+    return rc;
+}
+#endif /* LIBSSH2_ED25519 */
+
 /* Known-answer vectors: SHA-256 and HMAC-SHA-256 (RFC 4231 case 2) */
 static int test_hash_hmac(void)
 {
@@ -1529,6 +1846,9 @@ int main(int argc, char *argv[])
 #endif
 #if LIBSSH2_ECDSA
     rc |= test_ecdsa(session);
+#endif
+#if LIBSSH2_ED25519
+    rc |= test_ed25519(session);
 #endif
     rc |= test_hash_hmac();
 #if LIBSSH2_AES_CTR
