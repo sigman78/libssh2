@@ -65,7 +65,6 @@
 #include <mbedtls/pk.h>
 #include <mbedtls/asn1.h>
 #include <mbedtls/asn1write.h>
-#include <mbedtls/error.h>
 
 /* Define which features are supported. */
 #if defined(PSA_WANT_ALG_MD5) && PSA_WANT_ALG_MD5
