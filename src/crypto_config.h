@@ -64,6 +64,11 @@
 #define LIBSSH2_AES_CBC 0
 #endif
 
+#ifdef LIBSSH2_NO_AES_GCM
+#undef LIBSSH2_AES_GCM
+#define LIBSSH2_AES_GCM 0
+#endif
+
 #ifndef LIBSSH2_BLOWFISH_ENABLE
 #undef LIBSSH2_BLOWFISH
 #define LIBSSH2_BLOWFISH 0
