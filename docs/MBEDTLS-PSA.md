@@ -140,8 +140,8 @@ multiple of 16 bytes. libssh2's first GCM update is always 12 bytes, so the
 driver produces wrong ciphertext and wrong tags for `aes128-gcm@openssh.com`
 and `aes256-gcm@openssh.com`. This is a driver limitation, present with the
 legacy GCM code as well; it was invisible because `chacha20-poly1305@openssh.com`
-precedes AES-GCM in the cipher preference list. A device build must disable
-`LIBSSH2_AES_GCM` when the hardware AES driver is enabled, or patch the
+precedes AES-GCM in the cipher preference list. A device build must define
+`LIBSSH2_NO_AES_GCM` when the hardware AES driver is enabled, or patch the
 driver to keep its partial-block state in the context.
 
 ## Version support
