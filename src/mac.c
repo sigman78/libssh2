@@ -67,6 +67,62 @@ static const struct mac_method mac_method_none = {
 };
 #endif /* LIBSSH2DEBUG && LIBSSH2_MAC_NONE_INSECURE */
 
+#ifdef LIBSSH2_HMAC_KEYED
+/*
+ * The backend keeps an imported HMAC key across packets. The algorithm is
+ * only known when the first packet is hashed, so the key is imported then
+ * and the key bytes are dropped.
+ */
+struct mac_hmac_state {
+    unsigned char *key;
+    size_t key_len;
+    ssh2_hmac_key hkey;
+    int hkey_set;
+};
+
+/*
+ * Initialize simple mac methods
+ */
+static int mac_method_common_init(LIBSSH2_SESSION *session, unsigned char *key,
+                                  int *free_key, void **abstract)
+{
+    struct mac_hmac_state *st = ssh2_calloc(session, sizeof(*st));
+
+    *abstract = NULL;
+    *free_key = !st;  /* let the caller drop the key if we cannot keep it */
+    if(!st)
+        return -1;
+
+    /* the key is as long as the digest; take it from the method that is
+       being set up for this direction */
+    st->key = key;
+    st->key_len = (abstract == &session->remote.mac_abstract ?
+                   session->remote.mac : session->local.mac)->key_len;
+    *abstract = st;
+
+    return 0;
+}
+
+/*
+ * Cleanup simple mac methods
+ */
+static int mac_method_common_dtor(LIBSSH2_SESSION *session, void **abstract)
+{
+    struct mac_hmac_state *st = *abstract;
+
+    if(st) {
+        if(st->hkey_set)
+            ssh2_hmac_key_destroy(&st->hkey);
+        if(st->key)
+            ssh2_zero_free(session, st->key, st->key_len);
+        ssh2_explicit_zero(st, sizeof(*st));
+        SSH2_FREE(session, st);
+    }
+    *abstract = NULL;
+
+    return 0;
+}
+#else
 /*
  * Initialize simple mac methods
  */
@@ -91,6 +147,7 @@ static int mac_method_common_dtor(LIBSSH2_SESSION *session, void **abstract)
 
     return 0;
 }
+#endif /* LIBSSH2_HMAC_KEYED */
 
 /*
  * Calculate hash
@@ -105,13 +162,32 @@ static int mac_method_hmac(LIBSSH2_SESSION *session,
     ssh2_hmac_ctx ctx;
     unsigned char seqno_buf[4];
     int res;
+#ifdef LIBSSH2_HMAC_KEYED
+    struct mac_hmac_state *st = *abstract;
+
+    if(!st)
+        return 1;
+    if(!st->hkey_set) {
+        if(!st->key ||
+           !ssh2_hmac_key_import(&st->hkey, alg, st->key, st->key_len))
+            return 1;
+        st->hkey_set = 1;
+        ssh2_zero_free(session, st->key, st->key_len);
+        st->key = NULL;
+    }
+#else
     (void)session;
+#endif
 
     ssh2_htonu32(seqno_buf, seqno);
 
     if(!ssh2_hmac_ctx_init(&ctx))
         return 1;
+#ifdef LIBSSH2_HMAC_KEYED
+    res = ssh2_hmac_init_key(&ctx, alg, st->hkey) &&
+#else
     res = ssh2_hmac_init(&ctx, alg, *abstract, digest_len) &&
+#endif
           ssh2_hmac_update(&ctx, seqno_buf, 4) &&
           ssh2_hmac_update(&ctx, packet, packet_len);
     if(res && addtl && addtl_len)

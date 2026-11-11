@@ -94,6 +94,17 @@ int ssh2_hmac_update(ssh2_hmac_ctx *ctx, const void *input, size_t input_len);
 int ssh2_hmac_final(ssh2_hmac_ctx *ctx, void *mac, size_t mac_len);
 void ssh2_hmac_cleanup(ssh2_hmac_ctx *ctx);
 
+#ifdef LIBSSH2_HMAC_KEYED
+/* Optional: import an HMAC key once and start many contexts from it.
+   A context started from a key handle does not own the key and
+   ssh2_hmac_cleanup() leaves it alone. return: success = 1, error = 0 */
+int ssh2_hmac_key_import(ssh2_hmac_key *key, ssh2_hmac_alg alg,
+                         const void *key_data, size_t key_len);
+int ssh2_hmac_init_key(ssh2_hmac_ctx *ctx, ssh2_hmac_alg alg,
+                       ssh2_hmac_key key);
+void ssh2_hmac_key_destroy(ssh2_hmac_key *key);
+#endif
+
 #if LIBSSH2_MD5 || LIBSSH2_MD5_PEM
 #define SSH2_MD5_DIG_LEN                16
 #endif

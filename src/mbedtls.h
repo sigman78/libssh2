@@ -132,6 +132,10 @@ struct mbed_hash_ctx {
 
 #define ssh2_hmac_ctx          struct mbed_hash_ctx
 
+/* HMAC key kept in the PSA key store across packets */
+#define LIBSSH2_HMAC_KEYED
+#define ssh2_hmac_key          psa_key_id_t
+
 #define ssh2_hmac_update(ctx, d, l) \
     (psa_mac_update(&((ctx)->mac), (const uint8_t *)(d), l) == PSA_SUCCESS)
 

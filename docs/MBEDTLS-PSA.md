@@ -83,6 +83,13 @@ one of those. The PSA port removes all of them except one, described under
   on the stored 12-byte nonce; the invocation counter in nonce bytes 4..11 is
   incremented after every packet, whether or not it authenticated, exactly as
   the legacy code and the OpenSSL backend do.
+* **The transport HMAC key is imported once per direction.** The backend
+  announces `LIBSSH2_HMAC_KEYED` and offers `ssh2_hmac_key_import()`,
+  `ssh2_hmac_init_key()` and `ssh2_hmac_key_destroy()`. `mac.c` imports the
+  PSA key on the first packet of a MAC method, wipes and frees the key bytes
+  at that point, and destroys the key when the method is torn down (rekey or
+  session free). A context started from a key handle does not own the key.
+  The plain `ssh2_hmac_init()` still imports and destroys a key per call.
 * **Randomness is PSA's.** The private entropy + CTR-DRBG pair is gone;
   `psa_generate_random()` feeds everything, including the DH exponent, whose
   temporary buffer is wiped before release.

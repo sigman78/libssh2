@@ -1579,6 +1579,47 @@ fail:
     return rc;
 }
 
+#ifdef LIBSSH2_HMAC_KEYED
+static int test_hmac_keyed(void)
+{
+    static const unsigned char hmac_exp[32] = {
+        0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e,
+        0x6a, 0x04, 0x24, 0x26, 0x08, 0x95, 0x75, 0xc7,
+        0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83,
+        0x9d, 0xec, 0x58, 0xb9, 0x64, 0xec, 0x38, 0x43
+    };
+    unsigned char key[4] = { 'J', 'e', 'f', 'e' };
+    const char *data = "what do ya want for nothing?";
+    unsigned char out[32];
+    ssh2_hmac_key hkey;
+    ssh2_hmac_ctx mctx;
+    int imported = 0;
+    int i;
+    int rc = 1;
+
+    EXPECT(ssh2_hmac_key_import(&hkey, SSH2_SHA256_HMAC, key, sizeof(key)));
+    imported = 1;
+
+    /* one imported key serves several MACs; cleanup must not drop it */
+    for(i = 0; i < 2; i++) {
+        memset(out, 0, sizeof(out));
+        EXPECT(ssh2_hmac_ctx_init(&mctx));
+        EXPECT(ssh2_hmac_init_key(&mctx, SSH2_SHA256_HMAC, hkey));
+        EXPECT(ssh2_hmac_update(&mctx, data, strlen(data)));
+        EXPECT(ssh2_hmac_final(&mctx, out, sizeof(out)));
+        ssh2_hmac_cleanup(&mctx);
+        EXPECT(memcmp(out, hmac_exp, sizeof(out)) == 0);
+    }
+
+    rc = 0;
+
+fail:
+    if(imported)
+        ssh2_hmac_key_destroy(&hkey);
+    return rc;
+}
+#endif
+
 #if LIBSSH2_AES_CTR || LIBSSH2_AES_CBC
 static const unsigned char nist_key[16] = {
     0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
@@ -2234,6 +2275,9 @@ int main(int argc, char *argv[])
     rc = 0;
 #if LIBSSH2_RSA
     rc |= test_rsa(session);
+#endif
+#ifdef LIBSSH2_HMAC_KEYED
+    rc |= test_hmac_keyed();
 #endif
 #if LIBSSH2_ECDSA
     rc |= test_ecdsa(session);

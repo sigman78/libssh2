@@ -359,17 +359,39 @@ int ssh2_hmac_ctx_init(ssh2_hmac_ctx *ctx)
     return 1;
 }
 
+int ssh2_hmac_key_import(ssh2_hmac_key *key, ssh2_hmac_alg alg,
+                         const void *key_data, size_t key_len)
+{
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attributes, PSA_ALG_HMAC(alg));
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
+
+    return psa_import_key(&attributes, key_data, key_len, key) == PSA_SUCCESS;
+}
+
+int ssh2_hmac_init_key(ssh2_hmac_ctx *ctx, ssh2_hmac_alg alg,
+                       ssh2_hmac_key key)
+{
+    /* ctx->key_id stays NULL: the caller owns the key */
+    return psa_mac_sign_setup(&ctx->mac, key,
+                              PSA_ALG_HMAC(alg)) == PSA_SUCCESS;
+}
+
+void ssh2_hmac_key_destroy(ssh2_hmac_key *key)
+{
+    if(*key != PSA_KEY_ID_NULL)
+        (void)psa_destroy_key(*key);
+    *key = PSA_KEY_ID_NULL;
+}
+
 int ssh2_hmac_init(ssh2_hmac_ctx *ctx, ssh2_hmac_alg alg,
                    void *key, size_t key_len)
 {
-    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
     psa_algorithm_t alg_hmac = PSA_ALG_HMAC(alg);
 
-    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
-    psa_set_key_algorithm(&attributes, alg_hmac);
-    psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
-
-    if(psa_import_key(&attributes, key, key_len, &ctx->key_id) != PSA_SUCCESS)
+    if(!ssh2_hmac_key_import(&ctx->key_id, alg, key, key_len))
         return 0;
 
     if(psa_mac_sign_setup(&ctx->mac, ctx->key_id, alg_hmac) != PSA_SUCCESS) {
