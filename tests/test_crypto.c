@@ -1534,6 +1534,30 @@ fail:
 #endif /* LIBSSH2_ED25519 */
 
 /* Known-answer vectors: SHA-256 and HMAC-SHA-256 (RFC 4231 case 2) */
+static int test_bcrypt_pbkdf_kat(void)
+{
+    static const unsigned char exp[32] = {
+        0x5b, 0xbf, 0x0c, 0xc2, 0x93, 0x58, 0x7f, 0x1c,
+        0x36, 0x35, 0x55, 0x5c, 0x27, 0x79, 0x65, 0x98,
+        0xd4, 0x7e, 0x57, 0x90, 0x71, 0xbf, 0x42, 0x7e,
+        0x9d, 0x8f, 0xbe, 0x84, 0x2a, 0xba, 0x34, 0xd9
+    };
+    unsigned char out[32];
+    int rc = 1;
+
+    memset(out, 0, sizeof(out));
+    EXPECT(ssh2_bcrypt_pbkdf("password", 8, (const uint8_t *)"salt", 4,
+                             out, sizeof(out), 4) == 0);
+    EXPECT(memcmp(out, exp, sizeof(out)) == 0);
+    EXPECT(ssh2_bcrypt_pbkdf("", 0, (const uint8_t *)"salt", 4,
+                             out, sizeof(out), 4) < 0);
+
+    rc = 0;
+
+fail:
+    return rc;
+}
+
 static int test_hash_hmac(void)
 {
     static const unsigned char sha_abc[32] = {
@@ -2286,6 +2310,7 @@ int main(int argc, char *argv[])
     rc |= test_ed25519(session);
 #endif
     rc |= test_hash_hmac();
+    rc |= test_bcrypt_pbkdf_kat();
 #if LIBSSH2_AES_CTR
     rc |= test_aes_ctr_kat();
 #endif
