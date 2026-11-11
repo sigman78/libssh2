@@ -51,9 +51,9 @@
 #define BCRYPT_BLOCKS   8
 #define BCRYPT_HASHSIZE (BCRYPT_BLOCKS * 4)
 
-static void bcrypt_hash(uint8_t *sha2pass, uint8_t *sha2salt, uint8_t *out)
+static int bcrypt_hash(uint8_t *sha2pass, uint8_t *sha2salt, uint8_t *out)
 {
-    struct blf_ctx state;
+    struct blf_ctx *state;
     uint8_t ciphertext[BCRYPT_HASHSIZE] = {
         'O', 'x', 'y', 'c', 'h', 'r', 'o', 'm', 'a', 't', 'i', 'c',
         'B', 'l', 'o', 'w', 'f', 'i', 's', 'h',
@@ -64,12 +64,17 @@ static void bcrypt_hash(uint8_t *sha2pass, uint8_t *sha2salt, uint8_t *out)
     uint16_t j;
     uint16_t shalen = SSH2_SHA512_DIG_LEN;
 
+    /* the state is over 4 KB: keep it off small task stacks */
+    state = calloc(1, sizeof(*state));
+    if(!state)
+        return -1;
+
     /* key expansion */
-    Blowfish_initstate(&state);
-    Blowfish_expandstate(&state, sha2salt, shalen, sha2pass, shalen);
+    Blowfish_initstate(state);
+    Blowfish_expandstate(state, sha2salt, shalen, sha2pass, shalen);
     for(i = 0; i < 64; i++) {
-        Blowfish_expand0state(&state, sha2salt, shalen);
-        Blowfish_expand0state(&state, sha2pass, shalen);
+        Blowfish_expand0state(state, sha2salt, shalen);
+        Blowfish_expand0state(state, sha2pass, shalen);
     }
 
     /* encryption */
@@ -77,7 +82,7 @@ static void bcrypt_hash(uint8_t *sha2pass, uint8_t *sha2salt, uint8_t *out)
     for(i = 0; i < BCRYPT_BLOCKS; i++)
         cdata[i] = Blowfish_stream2word(ciphertext, sizeof(ciphertext), &j);
     for(i = 0; i < 64; i++)
-        blf_enc(&state, cdata, BCRYPT_BLOCKS / 2);
+        blf_enc(state, cdata, BCRYPT_BLOCKS / 2);
 
     /* copy out */
     for(i = 0; i < BCRYPT_BLOCKS; i++) {
@@ -90,7 +95,10 @@ static void bcrypt_hash(uint8_t *sha2pass, uint8_t *sha2salt, uint8_t *out)
     /* zap */
     ssh2_explicit_zero(ciphertext, sizeof(ciphertext));
     ssh2_explicit_zero(cdata, sizeof(cdata));
-    ssh2_explicit_zero(&state, sizeof(state));
+    ssh2_explicit_zero(state, sizeof(*state));
+    free(state);
+
+    return 0;
 }
 
 static int bcrypt_pbkdf(const char *pass, size_t passlen,
@@ -105,6 +113,7 @@ static int bcrypt_pbkdf(const char *pass, size_t passlen,
     size_t i, j, amt, stride;
     uint32_t count;
     size_t origkeylen = keylen;
+    int ret = -1;
 
     /* nothing crazy */
     if(rounds < 1)
@@ -124,10 +133,8 @@ static int bcrypt_pbkdf(const char *pass, size_t passlen,
 
     /* collapse password */
     if(!ssh2_hash(SSH2_SHA512_ALG, pass, passlen,
-                  sha2pass, sizeof(sha2pass))) {
-        free(countsalt);
-        return -1;
-    }
+                  sha2pass, sizeof(sha2pass)))
+        goto done;
 
     /* generate key, sizeof(out) at a time */
     for(count = 1; keylen > 0; count++) {
@@ -138,25 +145,21 @@ static int bcrypt_pbkdf(const char *pass, size_t passlen,
 
         /* first round, salt is salt */
         if(!ssh2_hash(SSH2_SHA512_ALG, countsalt, saltlen + 4,
-                      sha2salt, sizeof(sha2salt))) {
-            ssh2_explicit_zero(out, sizeof(out));
-            free(countsalt);
-            return -1;
-        }
+                      sha2salt, sizeof(sha2salt)))
+            goto done;
 
-        bcrypt_hash(sha2pass, sha2salt, tmpout);
+        if(bcrypt_hash(sha2pass, sha2salt, tmpout))
+            goto done;
         memcpy(out, tmpout, sizeof(out));
 
         for(i = 1; i < rounds; i++) {
             /* subsequent rounds, salt is previous output */
             if(!ssh2_hash(SSH2_SHA512_ALG, tmpout, sizeof(tmpout),
-                          sha2salt, sizeof(sha2salt))) {
-                ssh2_explicit_zero(out, sizeof(out));
-                free(countsalt);
-                return -1;
-            }
+                          sha2salt, sizeof(sha2salt)))
+                goto done;
 
-            bcrypt_hash(sha2pass, sha2salt, tmpout);
+            if(bcrypt_hash(sha2pass, sha2salt, tmpout))
+                goto done;
             for(j = 0; j < sizeof(out); j++)
                 out[j] ^= tmpout[j];
         }
@@ -174,11 +177,17 @@ static int bcrypt_pbkdf(const char *pass, size_t passlen,
         keylen -= i;
     }
 
+    ret = 0;
+
+done:
     /* zap */
+    ssh2_explicit_zero(sha2pass, sizeof(sha2pass));
+    ssh2_explicit_zero(sha2salt, sizeof(sha2salt));
+    ssh2_explicit_zero(tmpout, sizeof(tmpout));
     ssh2_explicit_zero(out, sizeof(out));
     free(countsalt);
 
-    return 0;
+    return ret;
 }
 
 /* Wrapper */
