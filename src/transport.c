@@ -212,26 +212,29 @@ static int transport_fullpacket(LIBSSH2_SESSION *session,
             /* Calculate MAC hash */
             int etm = remote_mac->etm;
             size_t mac_len = remote_mac->mac_len;
+            int mac_err;
             if(etm)  /* store hash here */
-                remote_mac->hash(session, macbuf,
-                                 session->remote.seqno,
-                                 p->payload, p->total_num - mac_len,
-                                 NULL, 0,
-                                 &session->remote.mac_abstract);
+                mac_err = remote_mac->hash(session, macbuf,
+                                           session->remote.seqno,
+                                           p->payload, p->total_num - mac_len,
+                                           NULL, 0,
+                                           &session->remote.mac_abstract);
             else  /* store hash here */
-                remote_mac->hash(session, macbuf,
-                                 session->remote.seqno,
-                                 p->init, 5,
-                                 p->payload,
-                                 session->fullpacket_payload_len,
-                                 &session->remote.mac_abstract);
+                mac_err = remote_mac->hash(session, macbuf,
+                                           session->remote.seqno,
+                                           p->init, 5,
+                                           p->payload,
+                                           session->fullpacket_payload_len,
+                                           &session->remote.mac_abstract);
 
             /* Compare the calculated hash with the MAC we read from
              * the network. The read one is at the end of the payload
              * buffer. Note that 'payload_len' here is the packet_length
              * field which includes the padding but not the MAC.
+             * A failed MAC computation counts as a failed check.
              */
-            if(ssh2_timingsafe_bcmp(macbuf,
+            if(mac_err ||
+               ssh2_timingsafe_bcmp(macbuf,
                                     p->payload + p->total_num - mac_len,
                                     mac_len)) {
                 ssh2_deb((session, LIBSSH2_TRACE_SOCKET, "Failed MAC check"));
