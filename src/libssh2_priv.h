@@ -975,6 +975,9 @@ struct _LIBSSH2_SESSION {
     ssh2_timediff_t keepalive_interval;
     int keepalive_want_reply;
     ssh2_time_t keepalive_last_sent;
+    /* Lives in the session so a retry after EAGAIN presents the same
+       address; the transport identifies a half-sent packet by it. */
+    unsigned char keepalive_packet[27];
 
     /* Configurable timeout for packets. Replaces LIBSSH2_READ_TIMEOUT */
     ssh2_timediff_t packet_read_timeout;

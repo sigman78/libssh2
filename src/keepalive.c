@@ -67,17 +67,26 @@ int libssh2_keepalive_send(LIBSSH2_SESSION *session, int *seconds_to_next)
     if(now >= session->keepalive_last_sent + session->keepalive_interval) {
         /* Format is
            "SSH_MSG_GLOBAL_REQUEST || 4-byte len || str || want-reply". */
-        unsigned char keepalive_data[] =
+        static const unsigned char keepalive_tmpl[] =
             "\x50\x00\x00\x00\x15keepalive@libssh2.orgW";
-        size_t len = sizeof(keepalive_data) - 1;
+        unsigned char *keepalive_data = session->keepalive_packet;
+        size_t len = sizeof(keepalive_tmpl) - 1;
         int rc;
 
+        memcpy(keepalive_data, keepalive_tmpl, len);
         keepalive_data[len - 1] = (unsigned char)session->keepalive_want_reply;
 
         rc = ssh2_transport_send(session, keepalive_data, len, NULL, 0);
-        /* Silently ignore PACKET_EAGAIN here: if the write buffer is
-           already full, sending another keepalive is not useful. */
-        if(rc && rc != LIBSSH2_ERROR_EAGAIN) {
+        /* On PACKET_EAGAIN the packet may be half-sent, and the transport
+           refuses every other sender until this same packet completes.
+           Do not count it as sent: the next call retries it with the same
+           buffer. */
+        if(rc == LIBSSH2_ERROR_EAGAIN) {
+            if(seconds_to_next)
+                *seconds_to_next = 0;
+            return LIBSSH2_ERROR_NONE;
+        }
+        if(rc) {
             ssh2_err(session, LIBSSH2_ERROR_SOCKET_SEND,
                      "Unable to send keepalive message");
             return rc;
