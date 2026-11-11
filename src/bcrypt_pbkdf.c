@@ -51,9 +51,9 @@
 #define BCRYPT_BLOCKS   8
 #define BCRYPT_HASHSIZE (BCRYPT_BLOCKS * 4)
 
-static int bcrypt_hash(uint8_t *sha2pass, uint8_t *sha2salt, uint8_t *out)
+static void bcrypt_hash(struct blf_ctx *state, uint8_t *sha2pass,
+                        uint8_t *sha2salt, uint8_t *out)
 {
-    struct blf_ctx *state;
     uint8_t ciphertext[BCRYPT_HASHSIZE] = {
         'O', 'x', 'y', 'c', 'h', 'r', 'o', 'm', 'a', 't', 'i', 'c',
         'B', 'l', 'o', 'w', 'f', 'i', 's', 'h',
@@ -63,11 +63,6 @@ static int bcrypt_hash(uint8_t *sha2pass, uint8_t *sha2salt, uint8_t *out)
     int i;
     uint16_t j;
     uint16_t shalen = SSH2_SHA512_DIG_LEN;
-
-    /* the state is over 4 KB: keep it off small task stacks */
-    state = calloc(1, sizeof(*state));
-    if(!state)
-        return -1;
 
     /* key expansion */
     Blowfish_initstate(state);
@@ -96,9 +91,6 @@ static int bcrypt_hash(uint8_t *sha2pass, uint8_t *sha2salt, uint8_t *out)
     ssh2_explicit_zero(ciphertext, sizeof(ciphertext));
     ssh2_explicit_zero(cdata, sizeof(cdata));
     ssh2_explicit_zero(state, sizeof(*state));
-    free(state);
-
-    return 0;
 }
 
 static int bcrypt_pbkdf(const char *pass, size_t passlen,
@@ -110,6 +102,7 @@ static int bcrypt_pbkdf(const char *pass, size_t passlen,
     uint8_t out[BCRYPT_HASHSIZE];
     uint8_t tmpout[BCRYPT_HASHSIZE];
     uint8_t *countsalt;
+    struct blf_ctx *state;
     size_t i, j, amt, stride;
     uint32_t count;
     size_t origkeylen = keylen;
@@ -124,8 +117,11 @@ static int bcrypt_pbkdf(const char *pass, size_t passlen,
     if(keylen > sizeof(out) * sizeof(out) || saltlen > 1 << 20)
         return -1;
     countsalt = calloc(1, saltlen + 4);
-    if(!countsalt)
-        return -1;
+    /* the state is over 4 KB: keep it off small task stacks, and allocate
+       it once rather than per bcrypt_hash() call */
+    state = calloc(1, sizeof(*state));
+    if(!countsalt || !state)
+        goto done;
     stride = (keylen + sizeof(out) - 1) / sizeof(out);
     amt = (keylen + stride - 1) / stride;
 
@@ -148,8 +144,7 @@ static int bcrypt_pbkdf(const char *pass, size_t passlen,
                       sha2salt, sizeof(sha2salt)))
             goto done;
 
-        if(bcrypt_hash(sha2pass, sha2salt, tmpout))
-            goto done;
+        bcrypt_hash(state, sha2pass, sha2salt, tmpout);
         memcpy(out, tmpout, sizeof(out));
 
         for(i = 1; i < rounds; i++) {
@@ -158,8 +153,7 @@ static int bcrypt_pbkdf(const char *pass, size_t passlen,
                           sha2salt, sizeof(sha2salt)))
                 goto done;
 
-            if(bcrypt_hash(sha2pass, sha2salt, tmpout))
-                goto done;
+            bcrypt_hash(state, sha2pass, sha2salt, tmpout);
             for(j = 0; j < sizeof(out); j++)
                 out[j] ^= tmpout[j];
         }
@@ -186,6 +180,10 @@ done:
     ssh2_explicit_zero(tmpout, sizeof(tmpout));
     ssh2_explicit_zero(out, sizeof(out));
     free(countsalt);
+    if(state) {
+        ssh2_explicit_zero(state, sizeof(*state));
+        free(state);
+    }
 
     return ret;
 }
